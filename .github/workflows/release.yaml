@@ -32,7 +32,7 @@ jobs:
         with:
           images: ghcr.io/loft-sh/rancher-nodeless-plugin
           tags: |
-            type=semver,pattern={{version}}
+            type=semver,prefix=kit-ar/fork/,pattern={{version}}
             type=raw,value=latest
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v2
