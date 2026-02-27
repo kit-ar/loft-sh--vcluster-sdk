@@ -25,15 +25,10 @@ var (
 )
 
 func NewImportSecrets(ctx *synccontext.RegisterContext) synctypes.Base {
-	mapper, err := ctx.Mappings.ByGVK(corev1.SchemeGroupVersion.WithKind("Secret"))
-	if err != nil {
-		klog.FromContext(ctx).Error(err, "unable to get mapping for corev1.Secret")
-		return nil
-	}
+	s := &importSecretSyncer{}
+	s.GenericTranslator = translator.NewGenericTranslator(ctx, "import-secret-syncer", &corev1.Secret{}, s)
 
-	return &importSecretSyncer{
-		GenericTranslator: translator.NewGenericTranslator(ctx, "import-secret", &corev1.Secret{}, mapper),
-	}
+	return s
 }
 
 type importSecretSyncer struct {
