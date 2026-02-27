@@ -13,6 +13,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/equality"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -26,13 +27,39 @@ var (
 
 func NewImportSecrets(ctx *synccontext.RegisterContext) synctypes.Base {
 	s := &importSecretSyncer{}
-	s.GenericTranslator = translator.NewGenericTranslator(ctx, "import-secret-syncer", &corev1.Secret{}, s)
+	s.GenericTranslator = translator.NewGenericTranslator(ctx, "import-secret-syncer", &corev1.Secret{}, &importSecretMapper{syncer: s})
+	klog.FromContext(ctx).Info("initialized import-secrets syncer")
 
 	return s
 }
 
 type importSecretSyncer struct {
 	synctypes.GenericTranslator
+}
+
+type importSecretMapper struct {
+	syncer *importSecretSyncer
+}
+
+func (m *importSecretMapper) Migrate(_ *synccontext.RegisterContext, _ synccontext.Mapper) error {
+	klog.Info("import-secrets mapper migrate: no-op")
+	return nil
+}
+
+func (m *importSecretMapper) GroupVersionKind() schema.GroupVersionKind {
+	return corev1.SchemeGroupVersion.WithKind("Secret")
+}
+
+func (m *importSecretMapper) IsManaged(ctx *synccontext.SyncContext, pObj client.Object) (bool, error) {
+	return m.syncer.IsManaged(ctx, pObj)
+}
+
+func (m *importSecretMapper) VirtualToHost(ctx *synccontext.SyncContext, req types.NamespacedName, vObj client.Object) types.NamespacedName {
+	return m.syncer.VirtualToHost(ctx, req, vObj)
+}
+
+func (m *importSecretMapper) HostToVirtual(ctx *synccontext.SyncContext, req types.NamespacedName, pObj client.Object) types.NamespacedName {
+	return m.syncer.HostToVirtual(ctx, req, pObj)
 }
 
 func (s *importSecretSyncer) Syncer() synctypes.Sync[client.Object] {
@@ -49,12 +76,14 @@ func (s *importSecretSyncer) SyncToVirtual(ctx *synccontext.SyncContext, event *
 
 	// ignore Secrets synced to the host by the vcluster
 	if pSecret.Labels != nil && pSecret.Labels[translate.MarkerLabel] != "" {
+		ctx.Log.Infof("skip host secret %s/%s: managed by vcluster marker label", pSecret.GetNamespace(), pSecret.GetName())
 		return ctrl.Result{}, nil
 	}
 
 	// try to parse import annotation
 	namespaceName := parseFromAnnotation(pSecret.Annotations, pImportAnnotation)
 	if namespaceName.Name == "" {
+		ctx.Log.Infof("skip host secret %s/%s: missing or malformed %s annotation", pSecret.GetNamespace(), pSecret.GetName(), pImportAnnotation)
 		return ctrl.Result{}, nil
 	}
 
@@ -89,6 +118,7 @@ func (s *importSecretSyncer) SyncToVirtual(ctx *synccontext.SyncContext, event *
 	err = ctx.VirtualClient.Create(ctx.Context, vSecret)
 	if err != nil {
 		if kerrors.IsAlreadyExists(err) {
+			ctx.Log.Infof("virtual secret already exists %s/%s", vSecret.Namespace, vSecret.Name)
 			return ctrl.Result{}, nil
 		}
 		return ctrl.Result{}, fmt.Errorf("failed to import secret %s/%s: %v", pSecret.GetNamespace(), pSecret.GetName(), err)
@@ -164,7 +194,12 @@ func (s *importSecretSyncer) IsManaged(ctx *synccontext.SyncContext, pObj client
 		return false, nil
 	}
 
-	return parseFromAnnotation(pObj.GetAnnotations(), pImportAnnotation).Name != "", nil
+	managed := parseFromAnnotation(pObj.GetAnnotations(), pImportAnnotation).Name != ""
+	if managed {
+		ctx.Log.Infof("host secret %s/%s is managed by import annotation", pObj.GetNamespace(), pObj.GetName())
+	}
+
+	return managed, nil
 }
 
 // VirtualToHost translates a virtual name to a physical name
