@@ -6,13 +6,20 @@ import (
 	"os"
 	"time"
 
+	vclusterconfig "github.com/loft-sh/vcluster/config"
 	"github.com/loft-sh/vcluster/pkg/config"
 	"github.com/loft-sh/vcluster/pkg/controllers/resources/nodes"
+	"github.com/loft-sh/vcluster/pkg/etcd"
+	"github.com/loft-sh/vcluster/pkg/mappings"
+	"github.com/loft-sh/vcluster/pkg/mappings/store"
+	"github.com/loft-sh/vcluster/pkg/mappings/store/verify"
 	"github.com/loft-sh/vcluster/pkg/plugin"
 	"github.com/loft-sh/vcluster/pkg/pro"
 	"github.com/loft-sh/vcluster/pkg/scheme"
+	"github.com/loft-sh/vcluster/pkg/syncer/synccontext"
 	"github.com/loft-sh/vcluster/pkg/telemetry"
 	"github.com/loft-sh/vcluster/pkg/util/blockingcacheclient"
+	"github.com/loft-sh/vcluster/pkg/util/pluginhookclient"
 	"github.com/pkg/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -35,15 +42,15 @@ var NewLocalManager = ctrl.NewManager
 var NewVirtualManager = ctrl.NewManager
 
 // NewControllerContext builds the controller context we can use to start the syncer
-func NewControllerContext(ctx context.Context, options *config.VirtualClusterConfig) (*config.ControllerContext, error) {
+func NewControllerContext(ctx context.Context, options *config.VirtualClusterConfig) (*synccontext.ControllerContext, error) {
 	// load virtual config
-	virtualConfig, virtualRawConfig, err := loadVirtualConfig(ctx, options)
+	virtualConfig, virtualRawConfig, err := LoadVirtualConfig(ctx, options)
 	if err != nil {
 		return nil, err
 	}
 
 	// start plugins
-	if !plugin.IsPlugin {
+	if !plugin.IsPlugin && !options.ControlPlane.Standalone.Enabled {
 		err = startPlugins(ctx, virtualConfig, virtualRawConfig, options)
 		if err != nil {
 			return nil, err
@@ -63,16 +70,19 @@ func NewControllerContext(ctx context.Context, options *config.VirtualClusterCon
 	}
 
 	// create physical manager
-	klog.Info("Using physical cluster at " + options.WorkloadConfig.Host)
-	localManager, err := NewLocalManager(options.WorkloadConfig, ctrl.Options{
-		Scheme:         scheme.Scheme,
-		Metrics:        metricsserver.Options{BindAddress: localManagerMetrics},
-		LeaderElection: false,
-		Cache:          getLocalCacheOptions(options),
-		NewClient:      pro.NewPhysicalClient(options),
-	})
-	if err != nil {
-		return nil, err
+	var localManager ctrl.Manager
+	if !options.ControlPlane.Standalone.Enabled {
+		klog.Info("Using physical cluster at " + options.HostConfig.Host)
+		localManager, err = NewLocalManager(options.HostConfig, ctrl.Options{
+			Scheme:         scheme.Scheme,
+			Metrics:        metricsserver.Options{BindAddress: localManagerMetrics},
+			LeaderElection: false,
+			Cache:          getLocalCacheOptions(options),
+			NewClient:      pluginhookclient.NewPhysicalPluginClientFactory(blockingcacheclient.NewCacheClient),
+		})
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// create virtual manager
@@ -80,7 +90,7 @@ func NewControllerContext(ctx context.Context, options *config.VirtualClusterCon
 		Scheme:         scheme.Scheme,
 		Metrics:        metricsserver.Options{BindAddress: virtualManagerMetrics},
 		LeaderElection: false,
-		NewClient:      pro.NewVirtualClient(options),
+		NewClient:      pluginhookclient.NewVirtualPluginClientFactory(blockingcacheclient.NewCacheClient),
 	})
 	if err != nil {
 		return nil, err
@@ -104,25 +114,32 @@ func NewControllerContext(ctx context.Context, options *config.VirtualClusterCon
 func getLocalCacheOptions(options *config.VirtualClusterConfig) cache.Options {
 	// is multi namespace mode?
 	defaultNamespaces := make(map[string]cache.Config)
-	if !options.Experimental.MultiNamespaceMode.Enabled {
-		defaultNamespaces[options.WorkloadTargetNamespace] = cache.Config{}
+	if !options.Sync.ToHost.Namespaces.Enabled {
+		defaultNamespaces[options.HostNamespace] = cache.Config{}
 	}
 	// do we need access to another namespace to export the kubeconfig ?
 	// we will need access to all the objects that the vcluster usually has access to
 	// otherwise the controller will not start
-	if options.ExportKubeConfig.Secret.Namespace != "" {
-		defaultNamespaces[options.ExportKubeConfig.Secret.Namespace] = cache.Config{}
+	for _, secret := range options.ExportKubeConfig.GetAdditionalSecrets() {
+		if secret.Namespace != "" {
+			defaultNamespaces[secret.Namespace] = cache.Config{}
+		}
 	}
 
 	if len(defaultNamespaces) == 0 {
 		return cache.Options{DefaultNamespaces: nil}
 	}
+
 	return cache.Options{DefaultNamespaces: defaultNamespaces}
 }
 
 func startPlugins(ctx context.Context, virtualConfig *rest.Config, virtualRawConfig *clientcmdapi.Config, options *config.VirtualClusterConfig) error {
 	klog.Infof("Start Plugins Manager...")
-	syncerConfig, err := CreateVClusterKubeConfig(virtualRawConfig, options)
+	createKubeConfigOptions := CreateKubeConfigOptions{
+		ControlPlaneProxy: options.ControlPlane.Proxy,
+		ExportKubeConfig:  options.ExportKubeConfig.ExportKubeConfigProperties,
+	}
+	syncerConfig, err := CreateVClusterKubeConfig(virtualRawConfig, createKubeConfigOptions)
 	if err != nil {
 		return err
 	}
@@ -135,11 +152,14 @@ func startPlugins(ctx context.Context, virtualConfig *rest.Config, virtualRawCon
 	return nil
 }
 
-func loadVirtualConfig(ctx context.Context, options *config.VirtualClusterConfig) (*rest.Config, *clientcmdapi.Config, error) {
+func LoadVirtualConfig(ctx context.Context, options *config.VirtualClusterConfig) (*rest.Config, *clientcmdapi.Config, error) {
 	// wait for client config
 	clientConfig, err := waitForClientConfig(ctx, options)
 	if err != nil {
 		return nil, nil, err
+	}
+	if clientConfig == nil {
+		return nil, nil, errors.New("nil clientConfig")
 	}
 
 	virtualClusterConfig, err := clientConfig.ClientConfig()
@@ -212,49 +232,108 @@ func waitForClientConfig(ctx context.Context, options *config.VirtualClusterConf
 	return clientConfig, nil
 }
 
-func CreateVClusterKubeConfig(config *clientcmdapi.Config, options *config.VirtualClusterConfig) (*clientcmdapi.Config, error) {
+// CreateKubeConfigOptions defines all config options that are available when creating a virtual cluster config.
+type CreateKubeConfigOptions struct {
+	// ControlPlaneProxy specifies the proxy settings for the virtual cluster control plane.
+	ControlPlaneProxy vclusterconfig.ControlPlaneProxy
+
+	// ExportKubeConfig specifies kubeconfig values that override the default kubeconfig.
+	ExportKubeConfig vclusterconfig.ExportKubeConfigProperties
+}
+
+func CreateVClusterKubeConfig(config *clientcmdapi.Config, options CreateKubeConfigOptions) (*clientcmdapi.Config, error) {
 	config = config.DeepCopy()
 
 	// exchange kube config server & resolve certificate
-	for i := range config.Clusters {
+	for _, cluster := range config.Clusters {
+		if cluster == nil {
+			continue
+		}
+
 		// fill in data
-		if config.Clusters[i].CertificateAuthorityData == nil && config.Clusters[i].CertificateAuthority != "" {
-			o, err := os.ReadFile(config.Clusters[i].CertificateAuthority)
+		if cluster.CertificateAuthorityData == nil && cluster.CertificateAuthority != "" {
+			o, err := os.ReadFile(cluster.CertificateAuthority)
 			if err != nil {
 				return nil, err
 			}
 
-			config.Clusters[i].CertificateAuthority = ""
-			config.Clusters[i].CertificateAuthorityData = o
+			cluster.CertificateAuthority = ""
+			cluster.CertificateAuthorityData = o
 		}
 
-		if options.ExportKubeConfig.Server != "" {
-			config.Clusters[i].Server = options.ExportKubeConfig.Server
-		} else {
-			config.Clusters[i].Server = fmt.Sprintf("https://localhost:%d", options.ControlPlane.Proxy.Port)
-		}
+		cluster.Server = fmt.Sprintf("https://localhost:%d", options.ControlPlaneProxy.Port)
 	}
 
 	// resolve auth info cert & key
-	for i := range config.AuthInfos {
-		// fill in data
-		if config.AuthInfos[i].ClientCertificateData == nil && config.AuthInfos[i].ClientCertificate != "" {
-			o, err := os.ReadFile(config.AuthInfos[i].ClientCertificate)
-			if err != nil {
-				return nil, err
-			}
-
-			config.AuthInfos[i].ClientCertificate = ""
-			config.AuthInfos[i].ClientCertificateData = o
+	for _, authInfo := range config.AuthInfos {
+		if authInfo == nil {
+			continue
 		}
-		if config.AuthInfos[i].ClientKeyData == nil && config.AuthInfos[i].ClientKey != "" {
-			o, err := os.ReadFile(config.AuthInfos[i].ClientKey)
+
+		// fill in data
+		if authInfo.ClientCertificateData == nil && authInfo.ClientCertificate != "" {
+			o, err := os.ReadFile(authInfo.ClientCertificate)
 			if err != nil {
 				return nil, err
 			}
 
-			config.AuthInfos[i].ClientKey = ""
-			config.AuthInfos[i].ClientKeyData = o
+			authInfo.ClientCertificate = ""
+			authInfo.ClientCertificateData = o
+		}
+		if authInfo.ClientKeyData == nil && authInfo.ClientKey != "" {
+			o, err := os.ReadFile(authInfo.ClientKey)
+			if err != nil {
+				return nil, err
+			}
+
+			authInfo.ClientKey = ""
+			authInfo.ClientKeyData = o
+		}
+	}
+
+	// exchange context name
+	if options.ExportKubeConfig.Context != "" {
+		config.CurrentContext = options.ExportKubeConfig.Context
+		// update authInfo
+		for k, authInfo := range config.AuthInfos {
+			if authInfo == nil {
+				continue
+			}
+
+			config.AuthInfos[config.CurrentContext] = authInfo
+			if k != config.CurrentContext {
+				delete(config.AuthInfos, k)
+			}
+			break
+		}
+
+		// update cluster
+		for k, cluster := range config.Clusters {
+			if cluster == nil {
+				continue
+			}
+
+			config.Clusters[config.CurrentContext] = cluster
+			if k != config.CurrentContext {
+				delete(config.Clusters, k)
+			}
+			break
+		}
+
+		// update context
+		for k, context := range config.Contexts {
+			if context == nil {
+				continue
+			}
+
+			tmpCtx := context
+			tmpCtx.Cluster = config.CurrentContext
+			tmpCtx.AuthInfo = config.CurrentContext
+			config.Contexts[config.CurrentContext] = tmpCtx
+			if k != config.CurrentContext {
+				delete(config.Contexts, k)
+			}
+			break
 		}
 	}
 
@@ -267,7 +346,11 @@ func initControllerContext(
 	virtualManager ctrl.Manager,
 	virtualRawConfig *clientcmdapi.Config,
 	vClusterOptions *config.VirtualClusterConfig,
-) (*config.ControllerContext, error) {
+) (*synccontext.ControllerContext, error) {
+	if virtualManager == nil {
+		return nil, errors.New("nil virtualManager")
+	}
+
 	stopChan := make(<-chan struct{})
 
 	// get virtual cluster version
@@ -280,79 +363,64 @@ func initControllerContext(
 		return nil, errors.Wrap(err, "get virtual cluster version")
 	}
 	nodes.FakeNodesVersion = virtualClusterVersion.GitVersion
-	klog.Infof("Can connect to virtual cluster with version " + virtualClusterVersion.GitVersion)
+	klog.FromContext(ctx).Info("Can connect to virtual cluster", "version", virtualClusterVersion.GitVersion)
 
 	// create a new current namespace client
-	currentNamespaceClient, err := newCurrentNamespaceClient(ctx, localManager, vClusterOptions)
-	if err != nil {
-		return nil, err
-	}
-
-	localDiscoveryClient, err := discovery.NewDiscoveryClientForConfig(localManager.GetConfig())
-	if err != nil {
-		return nil, err
-	}
-
-	err = vClusterOptions.DisableMissingAPIs(localDiscoveryClient)
-	if err != nil {
-		return nil, err
-	}
-
-	return &config.ControllerContext{
-		Context:               ctx,
-		LocalManager:          localManager,
-		VirtualManager:        virtualManager,
-		VirtualRawConfig:      virtualRawConfig,
-		VirtualClusterVersion: virtualClusterVersion,
-
-		WorkloadNamespaceClient: currentNamespaceClient,
-
-		StopChan: stopChan,
-		Config:   vClusterOptions,
-	}, nil
-}
-
-func newCurrentNamespaceClient(ctx context.Context, localManager ctrl.Manager, options *config.VirtualClusterConfig) (client.Client, error) {
-	var err error
-
-	// currentNamespaceCache is needed for tasks such as finding out fake kubelet ips
-	// as those are saved as Kubernetes services inside the same namespace as vcluster
-	// is running. In the case of options.TargetNamespace != currentNamespace (the namespace
-	// where vcluster is currently running in), we need to create a new object cache
-	// as the regular cache is scoped to the options.TargetNamespace and cannot return
-	// objects from the current namespace.
-	currentNamespaceCache := localManager.GetCache()
-	if !options.Experimental.MultiNamespaceMode.Enabled && options.WorkloadNamespace != options.WorkloadTargetNamespace {
-		currentNamespaceCache, err = cache.New(localManager.GetConfig(), cache.Options{
-			Scheme:            localManager.GetScheme(),
-			Mapper:            localManager.GetRESTMapper(),
-			DefaultNamespaces: map[string]cache.Config{options.WorkloadNamespace: {}},
-		})
+	var currentNamespaceClient client.Client
+	if !vClusterOptions.ControlPlane.Standalone.Enabled {
+		currentNamespaceClient = localManager.GetClient()
+		localDiscoveryClient, err := discovery.NewDiscoveryClientForConfig(localManager.GetConfig())
 		if err != nil {
 			return nil, err
 		}
 
-		// start cache now if it's not in the same namespace
-		go func() {
-			err := currentNamespaceCache.Start(ctx)
-			if err != nil {
-				panic(err)
-			}
-		}()
-		currentNamespaceCache.WaitForCacheSync(ctx)
+		err = vClusterOptions.DisableMissingAPIs(localDiscoveryClient)
+		if err != nil {
+			return nil, err
+		}
 	}
 
-	// create a current namespace client
-	currentNamespaceClient, err := blockingcacheclient.NewCacheClient(localManager.GetConfig(), client.Options{
-		Scheme: localManager.GetScheme(),
-		Mapper: localManager.GetRESTMapper(),
-		Cache: &client.CacheOptions{
-			Reader: currentNamespaceCache,
-		},
-	})
+	controllerContext := &synccontext.ControllerContext{
+		Context:     ctx,
+		HostManager: localManager,
+
+		VirtualManager:        virtualManager,
+		VirtualRawConfig:      virtualRawConfig,
+		VirtualClusterVersion: virtualClusterVersion,
+
+		HostNamespaceClient: currentNamespaceClient,
+
+		StopChan: stopChan,
+		Config:   vClusterOptions,
+	}
+
+	if vClusterOptions.PrivateNodes.Enabled {
+		// for private nodes, we don't need to configure etcd client because we don't need to store mappings
+		return controllerContext, nil
+	}
+
+	etcdClient, err := etcd.NewFromConfig(ctx, vClusterOptions)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("create etcd client: %w", err)
 	}
 
-	return currentNamespaceClient, nil
+	controllerContext.EtcdClient = etcdClient
+
+	var localClient client.Client
+	if localManager != nil {
+		localClient = localManager.GetClient()
+	}
+
+	mappingStore, err := store.NewStoreWithVerifyMapping(
+		ctx,
+		virtualManager.GetClient(),
+		localClient,
+		store.NewEtcdBackend(etcdClient),
+		verify.NewVerifyMapping(controllerContext.ToRegisterContext().ToSyncContext("verify-mapping")),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("start mapping store: %w", err)
+	}
+	controllerContext.Mappings = mappings.NewMappingsRegistry(mappingStore)
+	return controllerContext, nil
 }

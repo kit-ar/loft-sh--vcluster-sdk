@@ -15,7 +15,7 @@ import (
 
 	vclusterconfig "github.com/loft-sh/vcluster/config"
 	"github.com/loft-sh/vcluster/pkg/config"
-	"github.com/loft-sh/vcluster/pkg/k0s"
+	"github.com/loft-sh/vcluster/pkg/k8s"
 	"github.com/pkg/errors"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -52,6 +52,9 @@ const (
 	VClusterDeployConfigMapNamespace = "kube-system"
 )
 
+// default name for base64 bundle names when chart is not provided
+const defaultBundleName = "chart-bundle"
+
 type Deployer struct {
 	Log loghelper.Logger
 
@@ -59,13 +62,13 @@ type Deployer struct {
 	HelmClient     helm.Client
 }
 
-func (r *Deployer) Apply(ctx context.Context, vConfig *config.VirtualClusterConfig) (result ctrl.Result, err error) {
+func (r *Deployer) apply(ctx context.Context, vConfig *config.VirtualClusterConfig, fn func(context.Context, *config.VirtualClusterConfig, *corev1.ConfigMap) error) (err error) {
 	// get config map
 	configMap := &corev1.ConfigMap{}
 	err = r.VirtualManager.GetClient().Get(ctx, types.NamespacedName{Name: VClusterDeployConfigMap, Namespace: VClusterDeployConfigMapNamespace}, configMap)
 	if kerrors.IsNotFound(err) {
-		if vConfig.Experimental.Deploy.Manifests == "" && vConfig.Experimental.Deploy.ManifestsTemplate == "" && len(vConfig.Experimental.Deploy.Helm) == 0 {
-			return ctrl.Result{}, nil
+		if vConfig.Experimental.Deploy.VCluster.Manifests == "" && vConfig.Experimental.Deploy.VCluster.ManifestsTemplate == "" && len(vConfig.Experimental.Deploy.VCluster.Helm) == 0 {
+			return nil
 		}
 
 		configMap = &corev1.ConfigMap{
@@ -76,42 +79,39 @@ func (r *Deployer) Apply(ctx context.Context, vConfig *config.VirtualClusterConf
 		}
 		err = r.VirtualManager.GetClient().Create(ctx, configMap)
 		if err != nil {
-			return ctrl.Result{}, fmt.Errorf("create deploy status config map: %w", err)
+			return fmt.Errorf("create deploy status config map: %w", err)
 		}
 	} else if err != nil {
-		return ctrl.Result{}, err
+		return err
 	}
 
 	// patch the status to the configmap
 	oldConfigMap := configMap.DeepCopy()
 	defer func() {
-		patchErr := r.UpdateConfigMap(ctx, err, result.Requeue, oldConfigMap, configMap)
+		patchErr := r.UpdateConfigMap(ctx, err, vConfig, oldConfigMap, configMap)
 		if patchErr != nil && err == nil {
 			err = patchErr
 		}
 	}()
 
 	// process the init manifests
-	requeue, err := r.ProcessInitManifests(ctx, vConfig, configMap)
+	err = fn(ctx, vConfig, configMap)
 	if err != nil {
-		return ctrl.Result{}, err
-	} else if requeue {
-		return ctrl.Result{Requeue: true}, nil
+		return err
 	}
 
-	// process the helm charts
-	requeue, err = r.ProcessHelmChart(ctx, vConfig, configMap)
-	if err != nil {
-		return ctrl.Result{}, err
-	} else if requeue {
-		return ctrl.Result{Requeue: true}, nil
-	}
-
-	// indicates that we have applied all manifests and charts
-	return ctrl.Result{}, nil
+	return nil
 }
 
-func (r *Deployer) UpdateConfigMap(ctx context.Context, lastError error, requeue bool, oldConfigMap *corev1.ConfigMap, newConfigMap *corev1.ConfigMap) error {
+func (r *Deployer) DeployInitManifests(ctx context.Context, vConfig *config.VirtualClusterConfig) error {
+	return r.apply(ctx, vConfig, r.ProcessInitManifests)
+}
+
+func (r *Deployer) DeployHelmCharts(ctx context.Context, vConfig *config.VirtualClusterConfig) error {
+	return r.apply(ctx, vConfig, r.ProcessHelmChart)
+}
+
+func (r *Deployer) UpdateConfigMap(ctx context.Context, lastError error, vConfig *config.VirtualClusterConfig, oldConfigMap *corev1.ConfigMap, newConfigMap *corev1.ConfigMap) error {
 	currentStatus := ParseStatus(newConfigMap)
 
 	// set phase initially to pending
@@ -139,7 +139,7 @@ func (r *Deployer) UpdateConfigMap(ctx context.Context, lastError error, requeue
 	// check if there was an error otherwise set to success
 	if currentStatus.Phase == string(StatusPending) {
 		if lastError == nil {
-			if requeue {
+			if len(currentStatus.Charts) != len(vConfig.Experimental.Deploy.VCluster.Helm) {
 				currentStatus.Phase = string(StatusPending)
 			} else {
 				currentStatus.Phase = string(StatusSuccess)
@@ -167,7 +167,7 @@ func (r *Deployer) UpdateConfigMap(ctx context.Context, lastError error, requeue
 	}
 
 	// try patching the configmap
-	r.Log.Debugf("Patch init config map with: %s", string(rawPatch))
+	r.Log.Debugf("Patch deploy config map with: %s", string(rawPatch))
 	err = r.VirtualManager.GetClient().Patch(ctx, newConfigMap, client.RawPatch(patch.Type(), rawPatch))
 	if err != nil {
 		r.Log.Errorf("error updating configmap status: %v", err)
@@ -177,13 +177,13 @@ func (r *Deployer) UpdateConfigMap(ctx context.Context, lastError error, requeue
 	return nil
 }
 
-func (r *Deployer) ProcessInitManifests(ctx context.Context, vConfig *config.VirtualClusterConfig, configMap *corev1.ConfigMap) (bool, error) {
+func (r *Deployer) ProcessInitManifests(ctx context.Context, vConfig *config.VirtualClusterConfig, configMap *corev1.ConfigMap) error {
 	var err error
-	manifests := vConfig.Experimental.Deploy.Manifests
-	if vConfig.Experimental.Deploy.ManifestsTemplate != "" {
-		templatedManifests, err := k0s.ExecTemplate(vConfig.Experimental.Deploy.ManifestsTemplate, vConfig.Name, vConfig.WorkloadTargetNamespace, &vConfig.Config)
+	manifests := vConfig.Experimental.Deploy.VCluster.Manifests
+	if vConfig.Experimental.Deploy.VCluster.ManifestsTemplate != "" {
+		templatedManifests, err := k8s.ExecTemplate(vConfig.Experimental.Deploy.VCluster.ManifestsTemplate, vConfig.Name, vConfig.HostNamespace, &vConfig.Config)
 		if err != nil {
-			return false, fmt.Errorf("exec manifests template: %w", err)
+			return fmt.Errorf("exec manifests template: %w", err)
 		}
 
 		manifests += "\n---\n" + string(templatedManifests)
@@ -204,7 +204,7 @@ func (r *Deployer) ProcessInitManifests(ctx context.Context, vConfig *config.Vir
 
 	// should skip?
 	if manifests == lastAppliedManifests {
-		return false, r.setManifestsStatus(configMap, StatusSuccess, "", "")
+		return r.setManifestsStatus(configMap, StatusSuccess, "", "")
 	}
 
 	// apply manifests
@@ -212,32 +212,33 @@ func (r *Deployer) ProcessInitManifests(ctx context.Context, vConfig *config.Vir
 	if err != nil {
 		r.Log.Errorf("error applying init manifests: %v", err)
 		_ = r.setManifestsStatus(configMap, StatusFailed, InstallError, err.Error())
-		return false, err
+		return err
 	}
 
 	// apply successful, store in an annotation in the configmap itself
 	compressedManifests, err := compress.Compress(manifests)
 	if err != nil {
 		r.Log.Errorf("error compressing manifests: %v", err)
-		return false, err
+		return err
 	}
 
 	// update annotation
 	status.Manifests.LastAppliedManifests = compressedManifests
 	err = r.encodeStatus(configMap, status)
 	if err != nil {
-		return false, err
+		return err
 	}
-	return true, r.setManifestsStatus(configMap, StatusSuccess, "", "")
+
+	return r.setManifestsStatus(configMap, StatusSuccess, "", "")
 }
 
-func (r *Deployer) ProcessHelmChart(ctx context.Context, vConfig *config.VirtualClusterConfig, configMap *corev1.ConfigMap) (bool, error) {
+func (r *Deployer) ProcessHelmChart(ctx context.Context, vConfig *config.VirtualClusterConfig, configMap *corev1.ConfigMap) error {
 	statusMap, err := r.getStatusMap(configMap)
 	if err != nil {
-		return false, err
+		return err
 	}
 
-	charts := vConfig.Experimental.Deploy.Helm
+	charts := vConfig.Experimental.Deploy.VCluster.Helm
 	for _, chart := range charts {
 		releaseName, releaseNamespace := r.getTargetRelease(chart)
 		r.Log.Debugf("processing helm chart for %s/%s", releaseNamespace, releaseName)
@@ -246,36 +247,34 @@ func (r *Deployer) ProcessHelmChart(ctx context.Context, vConfig *config.Virtual
 		err := r.pullChartArchive(ctx, chart)
 		if err != nil {
 			_ = r.setChartStatus(configMap, &chart, StatusFailed, ChartPullError, err.Error())
-			return false, err
+			return err
 		}
 
 		// check if we should upgrade the helm release
 		exists, err := r.releaseExists(chart)
 		if err != nil {
-			return false, err
+			return err
 		} else if exists {
 			r.Log.Debugf("release %s/%s already exists", releaseNamespace, releaseName)
 
 			// check if upgrade is needed
 			upgradedNeeded, err := r.checkIfUpgradeNeeded(configMap, chart)
 			if err != nil {
-				return false, err
+				return err
 			} else if upgradedNeeded {
 				// initiate upgrade
 				err = r.initiateUpgrade(ctx, chart)
 				if err != nil {
 					_ = r.setChartStatus(configMap, &chart, StatusFailed, UpgradeError, err.Error())
-					return false, err
+					return err
 				}
 
 				// update last applied chart config
 				err = r.setChartStatusLastApplied(configMap, &chart)
 				if err != nil {
 					r.Log.Errorf("error updating config map with last applied chart annotation: %v", err)
-					return false, err
+					return err
 				}
-
-				return true, nil
 			}
 
 			// continue to process next chart
@@ -288,19 +287,15 @@ func (r *Deployer) ProcessHelmChart(ctx context.Context, vConfig *config.Virtual
 		if err != nil {
 			r.Log.Errorf("error installing release %s/%s", releaseNamespace, releaseName)
 			_ = r.setChartStatus(configMap, &chart, StatusFailed, InstallError, err.Error())
-			return false, err
+			return err
 		}
 
 		// update last applied chart config
 		err = r.setChartStatusLastApplied(configMap, &chart)
 		if err != nil {
 			r.Log.Errorf("error updating config map with last applied chart annotation: %v", err)
-			return false, err
+			return err
 		}
-
-		// install only one chart successfully in each reconcile
-		// hence reconcile here without error
-		return true, nil
 	}
 
 	if len(statusMap) > 0 {
@@ -308,12 +303,12 @@ func (r *Deployer) ProcessHelmChart(ctx context.Context, vConfig *config.Virtual
 		for _, chartStatus := range statusMap {
 			err := r.deleteHelmRelease(configMap, chartStatus)
 			if err != nil {
-				return false, errors.Wrap(err, "delete helm release")
+				return errors.Wrap(err, "delete helm release")
 			}
 		}
 	}
 
-	return false, nil
+	return nil
 }
 
 func (r *Deployer) checkIfUpgradeNeeded(cm *corev1.ConfigMap, chart vclusterconfig.ExperimentalDeployHelm) (bool, error) {
@@ -341,7 +336,7 @@ func (r *Deployer) initiateUpgrade(ctx context.Context, chart vclusterconfig.Exp
 	if err != nil {
 		return err
 	} else if path == "" {
-		return fmt.Errorf("couldn't find chart")
+		return fmt.Errorf("couldn't find chart %q", chart.Chart.Name)
 	}
 
 	values := chart.Values
@@ -376,51 +371,35 @@ func (r *Deployer) initiateUpgrade(ctx context.Context, chart vclusterconfig.Exp
 	return nil
 }
 
-func getTarballPath(helmWorkDir, repo, name, version string) (tarballPath, tarballDir string) {
+// getTarballDir is the location the chart should be pulled to. Chart names can be unpredictable so the temporary directory should be unique
+func getTarballDir(helmWorkDir, repo, name, version string) (tarballDir string) {
 	var repoDir string
 	// hashing the name so that slashes in url characters and other unaccounted-for characters
-	// don't fail making the directory
-	if repo != "" {
-		repoDigest := sha256.Sum256([]byte(repo))
-		repoDir = hex.EncodeToString(repoDigest[0:])[0:10]
-	}
-	// empty repoDir is ignored
+	// don't fail when creating the directory
+	repoDigest := sha256.Sum256([]byte(repo + name + version))
+	repoDir = hex.EncodeToString(repoDigest[0:])[0:10]
 	tarballDir = filepath.Join(helmWorkDir, repoDir)
-	tarballPath = filepath.Join(tarballDir, fmt.Sprintf("%s-%s.tgz", name, version))
 
-	return tarballPath, tarballDir
+	return tarballDir
 }
 
 func (r *Deployer) findChart(chart vclusterconfig.ExperimentalDeployHelm) (string, error) {
-	tarballPath, tarballDir := getTarballPath(HelmWorkDir, chart.Chart.Repo, chart.Chart.Name, chart.Chart.Version)
+	tarballDir := getTarballDir(HelmWorkDir, chart.Chart.Repo, chart.Chart.Name, chart.Chart.Version)
+	r.Log.Debugf("tarballdir for chart: %q", tarballDir)
 	// if version specified, look for specific file
-	if chart.Chart.Version != "" {
-		pathsToTry := []string{tarballPath}
-		// try with alternate names as well
-		if chart.Chart.Version[0] != 'v' {
-			tarballPathWithV, _ := getTarballPath(HelmWorkDir, chart.Chart.Repo, chart.Chart.Name, fmt.Sprintf("v%s", chart.Chart.Version))
-			pathsToTry = append(pathsToTry, tarballPathWithV)
-		}
-		for _, path := range pathsToTry {
-			_, err := os.Stat(path)
-			if err == nil {
-				return path, nil
-			} else if !os.IsNotExist(err) {
-				return "", err
-			}
-		}
-		// if version not specified, look for any version
-	} else {
-		files, err := os.ReadDir(tarballDir)
-		if os.IsNotExist(err) {
-			return "", nil
-		} else if err != nil {
-			return "", err
-		}
-		for _, f := range files {
-			if strings.HasPrefix(f.Name(), chart.Chart.Name+"-") {
-				return filepath.Join(tarballDir, f.Name()), nil
-			}
+
+	files, err := os.ReadDir(tarballDir)
+	if os.IsNotExist(err) {
+		return "", nil
+	} else if err != nil {
+		return "", err
+	}
+	for _, f := range files {
+		name := f.Name()
+		r.Log.Debugf("checking %q is chart", name)
+		if strings.HasPrefix(f.Name(), chart.Chart.Name) || strings.HasPrefix(f.Name(), defaultBundleName) {
+			r.Log.Debugf("%q is chart", name)
+			return filepath.Join(tarballDir, f.Name()), nil
 		}
 	}
 
@@ -434,7 +413,7 @@ func (r *Deployer) initiateInstall(ctx context.Context, chart vclusterconfig.Exp
 	if err != nil {
 		return err
 	} else if path == "" {
-		return fmt.Errorf("couldn't find chart")
+		return fmt.Errorf("couldn't find chart: %q", chart.Chart.Name)
 	}
 
 	values := chart.Values
@@ -500,7 +479,7 @@ func (r *Deployer) pullChartArchive(ctx context.Context, chart vclusterconfig.Ex
 
 	// check if tarball exists
 	if tarballPath == "" {
-		tarballPath, tarballDir := getTarballPath(HelmWorkDir, chart.Chart.Repo, chart.Chart.Name, chart.Chart.Version)
+		tarballDir := getTarballDir(HelmWorkDir, chart.Chart.Repo, chart.Chart.Name, chart.Chart.Version)
 		err := os.MkdirAll(tarballDir, 0755)
 		if err != nil {
 			return err
@@ -511,7 +490,14 @@ func (r *Deployer) pullChartArchive(ctx context.Context, chart vclusterconfig.Ex
 				return err
 			}
 
-			err = os.WriteFile(tarballPath, bytes, 0666)
+			bundleName := chart.Chart.Name
+			if bundleName == "" {
+				bundleName = defaultBundleName
+			}
+
+			chartPath := filepath.Join(tarballDir, bundleName+".tar.gz")
+			r.Log.Debugf("writing bundle to tarball: %q", chartPath)
+			err = os.WriteFile(chartPath, bytes, 0666)
 			if err != nil {
 				return errors.Wrap(err, "write bundle to file")
 			}

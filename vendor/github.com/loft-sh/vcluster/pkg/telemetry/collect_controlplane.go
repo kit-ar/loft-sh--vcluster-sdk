@@ -31,7 +31,7 @@ type ControlPlaneCollector interface {
 }
 
 func StartControlPlane(config *config.VirtualClusterConfig) {
-	if !config.Telemetry.Enabled || SyncerVersion == "dev" {
+	if !config.Telemetry.Enabled || SyncerVersion == "dev" || config.ControlPlane.Standalone.Enabled {
 		return
 	}
 
@@ -51,9 +51,9 @@ func newControlPlaneCollector(config *config.VirtualClusterConfig) (*controlPlan
 
 		log: loghelper.New("telemetry"),
 
-		hostClient:    config.ControlPlaneClient,
-		hostNamespace: config.ControlPlaneNamespace,
-		hostService:   config.ControlPlaneService,
+		hostClient:    config.HostClient,
+		hostNamespace: config.HostNamespace,
+		hostService:   config.Name,
 	}
 
 	go collector.startReportStatus(context.Background(), config.Telemetry.PlatformUserID, config.Telemetry.PlatformInstanceID, config.Telemetry.MachineID)
@@ -65,9 +65,10 @@ type controlPlaneCollector struct {
 
 	log loghelper.Logger
 
-	vClusterID            cachedValue[string]
-	hostClusterVersion    cachedValue[*KubernetesVersion]
-	virtualClusterVersion cachedValue[*KubernetesVersion]
+	vClusterID                cachedValue[string]
+	hostClusterVersion        cachedValue[*KubernetesVersion]
+	virtualClusterVersion     cachedValue[*KubernetesVersion]
+	vClusterCreationTimestamp cachedValue[int64]
 
 	hostClient    kubernetes.Interface
 	hostNamespace string
@@ -112,6 +113,10 @@ func (d *controlPlaneCollector) RecordStatus(ctx context.Context, platformUserID
 }
 
 func (d *controlPlaneCollector) RecordStart(ctx context.Context, config *config.VirtualClusterConfig) {
+	if !config.Telemetry.Enabled || config.ControlPlane.Standalone.Enabled {
+		return
+	}
+
 	chartInfo := d.getChartInfo(config)
 	properties := map[string]interface{}{
 		"vcluster_version":            SyncerVersion,
@@ -119,6 +124,7 @@ func (d *controlPlaneCollector) RecordStart(ctx context.Context, config *config.
 		"host_cluster_k8s_version":    d.getHostClusterVersion(),
 		"os_arch":                     runtime.GOOS + "/" + runtime.GOARCH,
 		"creation_method":             config.Telemetry.InstanceCreator,
+		"creation_timestamp":          d.getVClusterCreationTimestamp(ctx),
 	}
 	if chartInfo != nil {
 		properties["vcluster_k8s_distro"] = chartInfo.Name
@@ -146,6 +152,10 @@ func (d *controlPlaneCollector) RecordStart(ctx context.Context, config *config.
 }
 
 func (d *controlPlaneCollector) RecordError(ctx context.Context, config *config.VirtualClusterConfig, severity ErrorSeverityType, err error) {
+	if !config.Telemetry.Enabled || config.ControlPlane.Standalone.Enabled {
+		return
+	}
+
 	properties := map[string]interface{}{
 		"severity": string(severity),
 		"message":  err.Error(),
@@ -186,6 +196,10 @@ func (d *controlPlaneCollector) getVirtualClusterVersion() *KubernetesVersion {
 }
 
 func (d *controlPlaneCollector) getHostClusterVersion() *KubernetesVersion {
+	if d.hostClient == nil {
+		return nil
+	}
+
 	hostVersion, err := d.hostClusterVersion.Get(func() (*KubernetesVersion, error) {
 		return getKubernetesVersion(d.hostClient)
 	})
@@ -205,6 +219,10 @@ func (d *controlPlaneCollector) getChartInfo(config *config.VirtualClusterConfig
 }
 
 func (d *controlPlaneCollector) getVClusterID(ctx context.Context) string {
+	if d.hostClient == nil {
+		return ""
+	}
+
 	vClusterID, err := d.vClusterID.Get(func() (string, error) {
 		return getVClusterID(ctx, d.hostClient, d.hostNamespace, d.hostService)
 	})
@@ -213,6 +231,21 @@ func (d *controlPlaneCollector) getVClusterID(ctx context.Context) string {
 	}
 
 	return vClusterID
+}
+
+func (d *controlPlaneCollector) getVClusterCreationTimestamp(ctx context.Context) int64 {
+	if d.hostClient == nil {
+		return 0
+	}
+
+	vClusterCreationTimestamp, err := d.vClusterCreationTimestamp.Get(func() (int64, error) {
+		return getVClusterCreationTimestamp(ctx, d.hostClient, d.hostNamespace, d.hostService)
+	})
+	if err != nil {
+		klog.V(1).ErrorS(err, "Error retrieving vClusterCreationTimestamp")
+	}
+
+	return vClusterCreationTimestamp
 }
 
 func (d *controlPlaneCollector) getMetrics(ctx context.Context) map[string]interface{} {

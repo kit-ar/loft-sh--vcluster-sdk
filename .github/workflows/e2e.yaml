@@ -17,10 +17,11 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  VCLUSTER_VERSION: v0.20.0-beta.5
+  VCLUSTER_VERSION: v0.30.0
   VCLUSTER_SUFFIX: vcluster
   VCLUSTER_NAME: vcluster
   VCLUSTER_NAMESPACE: vcluster
+  VCLUSTER_BACKGROUND_PROXY_IMAGE: ghcr.io/loft-sh/vcluster-pro:0.30.0
 
 jobs:
   e2e-tests:
@@ -32,15 +33,15 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up Go
-        uses: actions/setup-go@v4
+        uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
 
       - name: Set up kind k8s cluster
         uses: engineerd/setup-kind@v0.5.0
         with:
-          version: "v0.20.0"
-          image: kindest/node:v1.28.0@sha256:b7a4cad12c197af3ba43202d3efe03246b3f0793f162afb40a33c923952d5b31
+          version: "v0.26.0"
+          image: kindest/node:v1.32.0@sha256:c48c62eac5da28cdadcf560d1d8616cfa6783b58f0d94cf63ad1bf49600cb027
 
       - name: Testing kind cluster set-up
         run: |
@@ -54,7 +55,7 @@ jobs:
         run: |
           # Build plugin
           docker build . -f e2e/test_plugin/Dockerfile -t ghcr.io/loft-sh/test-plugin:v1
-          
+
           # Import to kind cluster
           kind load docker-image ghcr.io/loft-sh/test-plugin:v1
 
@@ -63,12 +64,12 @@ jobs:
         continue-on-error: true
         run: |
           set -x
-          
+
           # download vcluster cli
           curl -L -o vcluster "https://github.com/loft-sh/vcluster/releases/download/${{ env.VCLUSTER_VERSION }}/vcluster-linux-amd64" && sudo install -c -m 0755 vcluster /usr/local/bin && rm -f vcluster
 
           # vcluster create
-          vcluster create ${{ env.VCLUSTER_SUFFIX }} --activate=false -n ${{ env.VCLUSTER_NAMESPACE }} \
+          vcluster create ${{ env.VCLUSTER_SUFFIX }} -n ${{ env.VCLUSTER_NAMESPACE }} \
           --create-namespace \
           --debug \
           --connect=false \
@@ -106,6 +107,7 @@ jobs:
         continue-on-error: true
         run: |
           set -x
+          docker pull ${{ env.VCLUSTER_BACKGROUND_PROXY_IMAGE }}
 
           VCLUSTER_SUFFIX=${{ env.VCLUSTER_SUFFIX }} VCLUSTER_NAME=${{ env.VCLUSTER_NAME }} VCLUSTER_NAMESPACE=${{ env.VCLUSTER_NAMESPACE }} go test -v -ginkgo.v -ginkgo.fail-fast
 

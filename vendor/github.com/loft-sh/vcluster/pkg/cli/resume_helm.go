@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/loft-sh/log"
@@ -12,10 +13,12 @@ import (
 )
 
 type ResumeOptions struct {
-	Manager string
+	Driver string
 
 	Project string
 }
+
+var ErrPlatformDriverRequired = errors.New("cannot resume a virtual cluster that is paused by the platform, please run 'vcluster use driver platform' or use the '--driver platform' flag")
 
 func ResumeHelm(ctx context.Context, globalFlags *flags.GlobalFlags, vClusterName string, log log.Logger) error {
 	vCluster, err := find.GetVCluster(ctx, globalFlags.Context, vClusterName, globalFlags.Namespace, log)
@@ -23,12 +26,16 @@ func ResumeHelm(ctx context.Context, globalFlags *flags.GlobalFlags, vClusterNam
 		return err
 	}
 
+	if vCluster.IsSleeping() {
+		return ErrPlatformDriverRequired
+	}
+
 	kubeClient, err := prepareResume(vCluster, globalFlags)
 	if err != nil {
 		return err
 	}
 
-	err = lifecycle.ResumeVCluster(ctx, kubeClient, vClusterName, globalFlags.Namespace, log)
+	err = lifecycle.ResumeVCluster(ctx, kubeClient, vClusterName, globalFlags.Namespace, false, log)
 	if err != nil {
 		return err
 	}

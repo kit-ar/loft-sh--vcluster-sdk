@@ -37,29 +37,22 @@ type ClusterAgentConfigCommon struct {
 	// +optional
 	LoftHost string `json:"loftHost,omitempty"`
 
+	// ProjectNamespacePrefix holds the prefix for loft project namespaces
+	// +optional
+	ProjectNamespacePrefix string `json:"projectNamespacePrefix,omitempty"`
+
 	// LoftInstanceID defines the instance id from the loft instance
 	// +optional
 	LoftInstanceID string `json:"loftInstanceID,omitempty"`
 
 	// AnalyticsSpec holds info needed for the agent to send analytics data to the analytics backend.
 	AnalyticsSpec AgentAnalyticsSpec `json:"analyticsSpec"`
-}
 
-// AgentLoftAccess holds the config how the agent can reach loft
-type AgentLoftAccess struct {
-	// Cluster is the name of the cluster the agent is running in
-	// +optional
-	Cluster string `json:"cluster,omitempty"`
+	// CostControl holds the settings related to the Cost Control ROI dashboard and its metrics gathering infrastructure
+	CostControl *AgentCostControlConfig `json:"costControl,omitempty"`
 
-	// LoftAPIHost defines the host for the loft api. If empty, Loft will
-	// create an ssh tunnel to the agent pod.
-	// +optional
-	LoftAPIHost string `json:"loftAPIHost,omitempty"`
-
-	// LoftAPIKey defines the api key the agent should use to connect to the
-	// loft api server.
-	// +optional
-	LoftAPIKey string `json:"loftAPIKey,omitempty"`
+	// AuthenticateVersionEndpoint will force authentication for the '/version' endpoint. Will only work with vCluster v0.27 & later
+	AuthenticateVersionEndpoint bool `json:"authenticateVersionEndpoint,omitempty"`
 }
 
 type AgentAuditConfig struct {
@@ -112,4 +105,14 @@ type AgentAuditConfig struct {
 // AgentAnalyticsSpec holds info the agent can use to send analytics data to the analytics backend.
 type AgentAnalyticsSpec struct {
 	AnalyticsEndpoint string `json:"analyticsEndpoint,omitempty"`
+}
+
+type AgentCostControlConfig struct {
+	// Enabled specifies whether the ROI dashboard should be available in the UI, and if the metrics infrastructure
+	// that provides dashboard data is deployed
+	Enabled *bool `json:"enabled,omitempty"`
+
+	// CostControlClusterConfig are settings for each cluster's managed components. These settings apply to all connected clusters
+	// unless overridden by modifying the Cluster's spec
+	CostControlClusterConfig `json:",inline"`
 }

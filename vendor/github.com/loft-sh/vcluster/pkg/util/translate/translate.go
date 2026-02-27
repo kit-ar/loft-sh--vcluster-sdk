@@ -10,7 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/loft-sh/vcluster/pkg/log"
+	"github.com/loft-sh/vcluster/pkg/scheme"
+	"github.com/loft-sh/vcluster/pkg/util/stringutil"
 	"github.com/pkg/errors"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	apiextensionsv1clientset "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
@@ -18,24 +19,13 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/rest"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-)
-
-var (
-	NamespaceLabel  = "vcluster.loft.sh/namespace"
-	MarkerLabel     = "vcluster.loft.sh/managed-by"
-	LabelPrefix     = "vcluster.loft.sh/label"
-	ControllerLabel = "vcluster.loft.sh/controlled-by"
-
-	// VClusterName is the vcluster name, usually set at start time
-	VClusterName = "suffix"
-
-	ManagedAnnotationsAnnotation = "vcluster.loft.sh/managed-annotations"
-	ManagedLabelsAnnotation      = "vcluster.loft.sh/managed-labels"
+	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 )
 
 const (
@@ -43,6 +33,152 @@ const (
 )
 
 var Owner client.Object
+
+func CopyObjectWithName[T client.Object](obj T, name types.NamespacedName, setOwner bool, excludedAnnotations ...string) T {
+	target := obj.DeepCopyObject().(T)
+
+	// reset metadata & translate name and namespace
+	ResetObjectMetadata(target)
+	target.SetName(name.Name)
+	if obj.GetNamespace() != "" {
+		target.SetNamespace(name.Namespace)
+
+		// set owning stateful set if defined
+		if setOwner && Owner != nil {
+			target.SetOwnerReferences(GetOwnerReference(obj))
+		}
+	}
+
+	stripExcludedAnnotations(target, excludedAnnotations...)
+	return target
+}
+
+func HostMetadata[T client.Object](vObj T, name types.NamespacedName, excludedAnnotations ...string) T {
+	pObj := CopyObjectWithName(vObj, name, true, excludedAnnotations...)
+	stripExcludedAnnotations(vObj, excludedAnnotations...)
+	pObj.SetAnnotations(HostAnnotations(vObj, pObj, excludedAnnotations...))
+	pObj.SetLabels(HostLabels(vObj, nil))
+	return pObj
+}
+
+func VirtualMetadata[T client.Object](pObj T, name types.NamespacedName, excludedAnnotations ...string) T {
+	vObj := CopyObjectWithName(pObj, name, false, excludedAnnotations...)
+	vObj.SetAnnotations(VirtualAnnotations(pObj, nil, excludedAnnotations...))
+	vObj.SetLabels(VirtualLabels(pObj, nil))
+	return vObj
+}
+
+func stripExcludedAnnotations(obj client.Object, excludedAnnotations ...string) {
+	annotations := obj.GetAnnotations()
+	for k := range annotations {
+		if stringutil.Contains(excludedAnnotations, k) {
+			delete(annotations, k)
+		}
+	}
+	obj.SetAnnotations(annotations)
+}
+
+func VirtualAnnotations(pObj, vObj client.Object, excluded ...string) map[string]string {
+	excluded = append(excluded, NameAnnotation, NamespaceAnnotation, HostNameAnnotation, HostNamespaceAnnotation, UIDAnnotation, KindAnnotation, ManagedAnnotationsAnnotation, ManagedLabelsAnnotation)
+	var toAnnotations map[string]string
+	if vObj != nil {
+		toAnnotations = vObj.GetAnnotations()
+	}
+
+	return copyMaps(pObj.GetAnnotations(), toAnnotations, func(key string) bool {
+		return exists(excluded, key)
+	})
+}
+
+func copyMaps(fromMap, toMap map[string]string, excludeKey func(string) bool) map[string]string {
+	retMap := map[string]string{}
+	for k, v := range fromMap {
+		if excludeKey != nil && excludeKey(k) {
+			continue
+		}
+
+		retMap[k] = v
+	}
+
+	for key := range toMap {
+		if excludeKey != nil && excludeKey(key) {
+			value, ok := toMap[key]
+			if ok {
+				retMap[key] = value
+			}
+		}
+	}
+
+	return retMap
+}
+
+func HostAnnotations(vObj, pObj client.Object, excluded ...string) map[string]string {
+	excluded = append(excluded, NameAnnotation, HostNameAnnotation, HostNamespaceAnnotation, UIDAnnotation, KindAnnotation, NamespaceAnnotation)
+	toAnnotations := map[string]string{}
+	if pObj != nil {
+		toAnnotations = pObj.GetAnnotations()
+		if toAnnotations == nil {
+			toAnnotations = map[string]string{}
+		}
+	}
+
+	retMap := applyAnnotations(vObj.GetAnnotations(), toAnnotations, excluded...)
+	addHostAnnotations(retMap, vObj, pObj)
+
+	return retMap
+}
+
+func addHostAnnotations(retMap map[string]string, vObj, pObj client.Object) {
+	retMap[NameAnnotation] = vObj.GetName()
+	retMap[UIDAnnotation] = string(vObj.GetUID())
+	if pObj != nil {
+		retMap[HostNameAnnotation] = pObj.GetName()
+		if pObj.GetNamespace() != "" {
+			retMap[HostNamespaceAnnotation] = pObj.GetNamespace()
+		}
+	}
+	if vObj.GetNamespace() == "" {
+		delete(retMap, NamespaceAnnotation)
+	} else {
+		retMap[NamespaceAnnotation] = vObj.GetNamespace()
+	}
+
+	gvk, err := apiutil.GVKForObject(vObj, scheme.Scheme)
+	if err == nil {
+		retMap[KindAnnotation] = gvk.String()
+	}
+}
+
+func ShouldDeleteHostObject(pObj client.Object) bool {
+	// if host object is deleting we should delete it
+	if pObj.GetDeletionTimestamp() != nil {
+		return true
+	}
+
+	// if host object was synced before we should delete it as well
+	annotations := pObj.GetAnnotations()
+
+	// if kind annotation doesn't match we don't delete
+	gvk, err := apiutil.GVKForObject(pObj, scheme.Scheme)
+	if annotations[KindAnnotation] == "" || err != nil || gvk.String() != annotations[KindAnnotation] {
+		return false
+	}
+
+	// if host object annotations don't match we don't delete
+	if annotations[NameAnnotation] == "" || annotations[HostNameAnnotation] == "" || annotations[HostNameAnnotation] != pObj.GetName() {
+		return false
+	}
+
+	// check namespace
+	if pObj.GetNamespace() != "" {
+		if annotations[NamespaceAnnotation] == "" || annotations[HostNamespaceAnnotation] == "" || annotations[HostNamespaceAnnotation] != pObj.GetNamespace() {
+			return false
+		}
+	}
+
+	// delete object because it was clearly synced
+	return true
+}
 
 func GetOwnerReference(object client.Object) []metav1.OwnerReference {
 	if Owner == nil || Owner.GetName() == "" || Owner.GetUID() == "" {
@@ -77,21 +213,6 @@ func SafeConcatName(name ...string) string {
 		return strings.ReplaceAll(fullPath[0:52]+"-"+hex.EncodeToString(digest[0:])[0:10], ".-", "-")
 	}
 	return fullPath
-}
-
-func UniqueSlice(stringSlice []string) []string {
-	keys := make(map[string]bool)
-	list := []string{}
-	for _, entry := range stringSlice {
-		if entry == "" {
-			continue
-		}
-		if _, value := keys[entry]; !value {
-			keys[entry] = true
-			list = append(list, entry)
-		}
-	}
-	return list
 }
 
 func Split(s, sep string) (string, string) {
@@ -183,7 +304,7 @@ type ApplyMapsOptions struct {
 	ExcludeKeys []string
 }
 
-func applyMaps(fromMap map[string]string, toMap map[string]string, opts ApplyMapsOptions) (map[string]string, string) {
+func applyMaps(fromMap, toMap map[string]string, opts ApplyMapsOptions) (map[string]string, string) {
 	retMap := map[string]string{}
 	managedKeys := []string{}
 	for k, v := range fromMap {
@@ -197,9 +318,7 @@ func applyMaps(fromMap map[string]string, toMap map[string]string, opts ApplyMap
 
 	for key, value := range toMap {
 		if exists(opts.ExcludeKeys, key) {
-			if value != "" {
-				retMap[key] = value
-			}
+			retMap[key] = value
 			continue
 		} else if exists(managedKeys, key) || exists(opts.ManagedKeys, key) {
 			continue
@@ -213,6 +332,149 @@ func applyMaps(fromMap map[string]string, toMap map[string]string, opts ApplyMap
 	return retMap, managedKeysStr
 }
 
+func hasStatus(version apiextensionsv1.CustomResourceDefinitionVersion) bool {
+	return version.Subresources != nil && version.Subresources.Status != nil
+}
+
+func getCrdVersionByName(crdVersions []apiextensionsv1.CustomResourceDefinitionVersion, versionName string) *apiextensionsv1.CustomResourceDefinitionVersion {
+	for _, version := range crdVersions {
+		if version.Name == versionName {
+			return &version
+		}
+	}
+	return nil
+}
+
+// checkSubresourceStatus checks if the CRD has the status subresource and returns whether it is cluster scoped and if the status subresource exists.
+// It returns true if the CRD is cluster scoped, and true if the status subresource exists.
+func checkSubresourceStatus(ctx context.Context, vClient *apiextensionsv1clientset.Clientset, apiResource metav1.APIResource, groupVersionKind schema.GroupVersionKind) (bool, bool, error) {
+	var err error
+	isClusterScoped := !apiResource.Namespaced
+	hasStatusSubresource := false
+
+	klog.FromContext(ctx).Info("CRD already exists in virtual cluster, checking for status subresource.", "apiResource", apiResource, "groupVersionKind", groupVersionKind)
+
+	crdName := apiResource.Name
+	if apiResource.Group != "" {
+		crdName += "." + apiResource.Group
+	} else if groupVersionKind.Group != "" {
+		crdName += "." + groupVersionKind.Group
+	}
+
+	crdDefinition, err := vClient.ApiextensionsV1().CustomResourceDefinitions().Get(ctx, crdName, metav1.GetOptions{})
+	if err != nil {
+		klog.FromContext(ctx).Error(err, "Error getting CRD in the virtual cluster", "crd", crdName)
+		return isClusterScoped, hasStatusSubresource, err
+	}
+
+	for _, version := range crdDefinition.Spec.Versions {
+		if version.Name == groupVersionKind.Version && hasStatus(version) {
+			hasStatusSubresource = true
+			return isClusterScoped, hasStatusSubresource, err
+		}
+	}
+	return isClusterScoped, hasStatusSubresource, err
+}
+
+func crdUpdateWithNewVersion(ctx context.Context, vClient *apiextensionsv1clientset.Clientset, pCrdDefinition, vCrdDefinition *apiextensionsv1.CustomResourceDefinition, groupVersionKind schema.GroupVersionKind) (bool, bool, error) {
+	var err error
+	isClusterScoped := vCrdDefinition.Spec.Scope == apiextensionsv1.ClusterScoped
+	hasStatusSubresource := false
+
+	// CRD exists but with different version. Need to add the new version to it, and set as storage version if it is not already set.
+	klog.FromContext(ctx).Info("CRD found in virtual cluster, checking versions", "crd", vCrdDefinition.Name, "groupVersionKind", groupVersionKind)
+
+	newVersions := []apiextensionsv1.CustomResourceDefinitionVersion{}
+	for _, version := range vCrdDefinition.Spec.Versions {
+		if version.Name == groupVersionKind.Version {
+			continue
+		}
+		version.Storage = false
+		newVersions = append(newVersions, version)
+	}
+
+	// Version not found, we need to add it
+	klog.FromContext(ctx).Info("CRD version not found in virtual cluster, adding it", "version", groupVersionKind.Version, "crd", vCrdDefinition.Name)
+	newVersion := getCrdVersionByName(pCrdDefinition.Spec.Versions, groupVersionKind.Version)
+	if newVersion == nil {
+		err = fmt.Errorf("could not find version %q in physical CRD %q", groupVersionKind.Version, pCrdDefinition.Name)
+		return isClusterScoped, hasStatusSubresource, err
+	}
+	newVersion.Storage = true
+	newVersions = append(newVersions, *newVersion)
+	vCrdDefinition.Spec.Versions = newVersions
+	// Update the CRD in the virtual cluster
+	klog.FromContext(ctx).Info("Updating CRD in virtual cluster with new version", "crd", vCrdDefinition.Name, "version", groupVersionKind.Version)
+	_, err = vClient.ApiextensionsV1().CustomResourceDefinitions().Update(ctx, vCrdDefinition, metav1.UpdateOptions{})
+	if err != nil {
+		err = fmt.Errorf("update crd in virtual cluster: %w", err)
+		return isClusterScoped, hasStatusSubresource, err
+	}
+	// Check if the status subresource is set
+	hasStatusSubresource = hasStatus(*newVersion)
+	klog.FromContext(ctx).Info("CRD updated in virtual cluster", "crd", vCrdDefinition.Name, "version", groupVersionKind.Version, "hasStatusSubresource", hasStatusSubresource)
+	return isClusterScoped, hasStatusSubresource, err
+}
+
+func createCrdFromPhysicalCluster(ctx context.Context, vClient *apiextensionsv1clientset.Clientset, pCrdDefinition *apiextensionsv1.CustomResourceDefinition, groupVersionResource schema.GroupVersionResource, groupVersionKind schema.GroupVersionKind) (bool, bool, error) {
+	var err error
+	isClusterScoped := pCrdDefinition.Spec.Scope == apiextensionsv1.ClusterScoped
+	hasStatusSubresource := false
+
+	pCrdDefinition.UID = ""
+	pCrdDefinition.ResourceVersion = ""
+	pCrdDefinition.ManagedFields = nil
+	pCrdDefinition.OwnerReferences = nil
+	pCrdDefinition.Status = apiextensionsv1.CustomResourceDefinitionStatus{}
+	pCrdDefinition.Spec.PreserveUnknownFields = false
+	pCrdDefinition.Spec.Conversion = nil
+
+	// make sure we only store the version we care about
+	newVersions := []apiextensionsv1.CustomResourceDefinitionVersion{}
+	for _, version := range pCrdDefinition.Spec.Versions {
+		if version.Name == groupVersionKind.Version {
+			version.Served = true
+			version.Storage = true
+			newVersions = append(newVersions, version)
+
+			hasStatusSubresource = hasStatus(version)
+			break
+		}
+	}
+	pCrdDefinition.Spec.Versions = newVersions
+
+	// apply the crd
+	klog.FromContext(ctx).Info("Create crd in virtual cluster", "crd", groupVersionKind.String())
+	_, err = vClient.ApiextensionsV1().CustomResourceDefinitions().Create(ctx, pCrdDefinition, metav1.CreateOptions{})
+	if err != nil && !kerrors.IsAlreadyExists(err) {
+		err = errors.Wrap(err, "create crd in virtual cluster")
+		return isClusterScoped, hasStatusSubresource, err
+	}
+
+	// wait for crd to become ready
+	klog.FromContext(ctx).Info("Wait for crd to become ready in virtual cluster", "crd", groupVersionKind.String())
+	err = wait.ExponentialBackoffWithContext(ctx, wait.Backoff{Duration: time.Second, Factor: 1.5, Cap: time.Minute, Steps: math.MaxInt32}, func(ctx context.Context) (bool, error) {
+		crdDefinition, err := vClient.ApiextensionsV1().CustomResourceDefinitions().Get(ctx, groupVersionResource.GroupResource().String(), metav1.GetOptions{})
+		if err != nil {
+			return false, errors.Wrap(err, "retrieve crd in virtual cluster")
+		}
+		message := ""
+		for _, cond := range crdDefinition.Status.Conditions {
+			if cond.Type == apiextensionsv1.Established && cond.Status == apiextensionsv1.ConditionTrue {
+				return true, nil
+			} else if cond.Type == apiextensionsv1.Established {
+				message = cond.String()
+			}
+		}
+		klog.FromContext(ctx).Info("CRD is not ready yet", "crd", groupVersionKind.String(), "message", message)
+		return false, nil
+	})
+	if err != nil {
+		err = fmt.Errorf("failed to wait for CRD %s to become ready: %w", groupVersionKind.String(), err)
+	}
+	return isClusterScoped, hasStatusSubresource, err
+}
+
 func EnsureCRDFromPhysicalCluster(ctx context.Context, pConfig *rest.Config, vConfig *rest.Config, groupVersionKind schema.GroupVersionKind) (bool, bool, error) {
 	var isClusterScoped, hasStatusSubresource bool
 
@@ -220,38 +482,9 @@ func EnsureCRDFromPhysicalCluster(ctx context.Context, pConfig *rest.Config, vCo
 	if err != nil {
 		return isClusterScoped, hasStatusSubresource, err
 	}
-
-	if apiResource, err := KindExists(vConfig, groupVersionKind); err == nil {
-		// (ThomasK33): Check if the CRD has the status subresource
-		isClusterScoped = !apiResource.Namespaced
-
-		klog.FromContext(ctx).Info("CRD already exists in virtual cluster, checking for status subresource.", "apiResource", apiResource, "groupVersionKind", groupVersionKind)
-
-		crdName := apiResource.Name
-		if apiResource.Group != "" {
-			crdName += "." + apiResource.Group
-		} else if groupVersionKind.Group != "" {
-			crdName += "." + groupVersionKind.Group
-		}
-
-		crdDefinition, err := vClient.ApiextensionsV1().CustomResourceDefinitions().Get(ctx, crdName, metav1.GetOptions{})
-		if err != nil {
-			log.NewWithoutName().Infof("Error getting CRD %s in the virtual cluster: %v", crdName, err)
-			return isClusterScoped, hasStatusSubresource, nil
-		}
-
-		for _, version := range crdDefinition.Spec.Versions {
-			if version.Name == groupVersionKind.Version {
-				if version.Subresources != nil && version.Subresources.Status != nil {
-					hasStatusSubresource = true
-				}
-				break
-			}
-		}
-
-		return isClusterScoped, hasStatusSubresource, nil
-	} else if !kerrors.IsNotFound(err) {
-		return isClusterScoped, hasStatusSubresource, fmt.Errorf("check virtual cluster kind: %w", err)
+	pClient, err := apiextensionsv1clientset.NewForConfig(pConfig)
+	if err != nil {
+		return isClusterScoped, hasStatusSubresource, err
 	}
 
 	// get resource from kind name in physical cluster
@@ -260,77 +493,34 @@ func EnsureCRDFromPhysicalCluster(ctx context.Context, pConfig *rest.Config, vCo
 		if kerrors.IsNotFound(err) {
 			return isClusterScoped, hasStatusSubresource, fmt.Errorf("seems like resource %s is not available in the physical cluster or vcluster has no access to it", groupVersionKind.String())
 		}
-
 		return isClusterScoped, hasStatusSubresource, err
 	}
 
-	// get crd in physical cluster
-	pClient, err := apiextensionsv1clientset.NewForConfig(pConfig)
-	if err != nil {
-		return isClusterScoped, hasStatusSubresource, err
-	}
-	crdDefinition, err := pClient.ApiextensionsV1().CustomResourceDefinitions().Get(ctx, groupVersionResource.GroupResource().String(), metav1.GetOptions{})
+	pCrdDefinition, err := pClient.ApiextensionsV1().CustomResourceDefinitions().Get(ctx, groupVersionResource.GroupResource().String(), metav1.GetOptions{})
 	if err != nil {
 		return isClusterScoped, hasStatusSubresource, errors.Wrap(err, "retrieve crd in host cluster")
 	}
 
-	// now create crd in virtual cluster
-	crdDefinition.UID = ""
-	crdDefinition.ResourceVersion = ""
-	crdDefinition.ManagedFields = nil
-	crdDefinition.OwnerReferences = nil
-	crdDefinition.Status = apiextensionsv1.CustomResourceDefinitionStatus{}
-	crdDefinition.Spec.PreserveUnknownFields = false
-	crdDefinition.Spec.Conversion = nil
-
-	// make sure we only store the version we care about
-	newVersions := []apiextensionsv1.CustomResourceDefinitionVersion{}
-	for _, version := range crdDefinition.Spec.Versions {
-		if version.Name == groupVersionKind.Version {
-			version.Served = true
-			version.Storage = true
-			newVersions = append(newVersions, version)
-
-			if version.Subresources != nil && version.Subresources.Status != nil {
-				hasStatusSubresource = true
-			}
-			break
-		}
+	vCrdDefinition, err := vClient.ApiextensionsV1().CustomResourceDefinitions().Get(ctx, groupVersionResource.GroupResource().String(), metav1.GetOptions{})
+	if err != nil && !kerrors.IsNotFound(err) {
+		return isClusterScoped, hasStatusSubresource, fmt.Errorf("retrieve crd in virtual cluster: %w", err)
 	}
-	crdDefinition.Spec.Versions = newVersions
+	vCrdExists := err == nil
 
-	// apply the crd
-
-	log.NewWithoutName().Infof("Create crd %s in virtual cluster", groupVersionKind.String())
-	_, err = vClient.ApiextensionsV1().CustomResourceDefinitions().Create(ctx, crdDefinition, metav1.CreateOptions{})
-	if err != nil {
-		return isClusterScoped, hasStatusSubresource, errors.Wrap(err, "create crd in virtual cluster")
+	apiResource, err := KindExists(vConfig, groupVersionKind)
+	if err != nil && !kerrors.IsNotFound(err) { // If the kind does not exist, we will create it in the virtual cluster
+		return isClusterScoped, hasStatusSubresource, fmt.Errorf("check virtual cluster kind: %w", err)
 	}
+	exactMatchInVCluster := err == nil
 
-	// wait for crd to become ready
-	log.NewWithoutName().Infof("Wait for crd %s to become ready in virtual cluster", groupVersionKind.String())
-	err = wait.ExponentialBackoffWithContext(ctx, wait.Backoff{Duration: time.Second, Factor: 1.5, Cap: time.Minute, Steps: math.MaxInt32}, func(ctx context.Context) (bool, error) {
-		crdDefinition, err := vClient.ApiextensionsV1().CustomResourceDefinitions().Get(ctx, groupVersionResource.GroupResource().String(), metav1.GetOptions{})
-		if err != nil {
-			return false, errors.Wrap(err, "retrieve crd in virtual cluster")
-		}
-		for _, cond := range crdDefinition.Status.Conditions {
-			if cond.Type == apiextensionsv1.Established && cond.Status == apiextensionsv1.ConditionTrue {
-				return true, nil
-			}
-		}
-		return false, nil
-	})
-	if err != nil {
-		return isClusterScoped, hasStatusSubresource, fmt.Errorf("failed to wait for CRD %s to become ready: %w", groupVersionKind.String(), err)
+	switch {
+	case exactMatchInVCluster: // CRD exists in the physical cluster and in the virtual cluster with the same GVK
+		return checkSubresourceStatus(ctx, vClient, apiResource, groupVersionKind)
+	case vCrdExists: // CRD exists in the virtual cluster but needs an update to add the new version
+		return crdUpdateWithNewVersion(ctx, vClient, pCrdDefinition, vCrdDefinition, groupVersionKind)
+	default: // CRD does not exist in the virtual cluster, need to create it
+		return createCrdFromPhysicalCluster(ctx, vClient, pCrdDefinition, groupVersionResource, groupVersionKind)
 	}
-
-	// check if crd is cluster scoped
-	if crdDefinition.Spec.Scope == apiextensionsv1.ClusterScoped {
-		isClusterScoped = true
-	}
-
-	return isClusterScoped, hasStatusSubresource, nil
 }
 
 func ConvertKindToResource(config *rest.Config, groupVersionKind schema.GroupVersionKind) (schema.GroupVersionResource, error) {

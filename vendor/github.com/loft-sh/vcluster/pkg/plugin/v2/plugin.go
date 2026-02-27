@@ -108,7 +108,6 @@ func (m *Manager) Start(
 	for _, vClusterPlugin := range m.Plugins {
 		// build the start request
 		initRequest, err := m.buildInitRequest(filepath.Dir(vClusterPlugin.Path), syncerConfig, vConfig, port)
-
 		if err != nil {
 			return fmt.Errorf("build start request: %w", err)
 		}
@@ -571,6 +570,9 @@ func (m *Manager) registerNonResourceURL(port int, interceptorsInfos Interceptor
 		if nonResourceURL == "" {
 			continue
 		}
+		if m.NonResourceInterceptorsPorts[nonResourceURL] == nil {
+			m.NonResourceInterceptorsPorts[nonResourceURL] = make(map[string]portHandlerName, 0)
+		}
 		for _, v := range interceptorsInfos.Verbs {
 			if _, ok := m.NonResourceInterceptorsPorts[nonResourceURL][v]; ok {
 				return fmt.Errorf("error while loading the plugins, multiple interceptor plugins are registered for the same non resource url %s and verb %s", nonResourceURL, v)
@@ -635,7 +637,7 @@ func (m *Manager) buildInitRequest(
 	}
 
 	// Physical client config
-	convertedPhysicalConfig, err := kubeconfig.ConvertRestConfigToClientConfig(vConfig.WorkloadConfig)
+	convertedPhysicalConfig, err := kubeconfig.ConvertRestConfigToClientConfig(vConfig.HostConfig)
 	if err != nil {
 		return nil, fmt.Errorf("convert physical client config: %w", err)
 	}
@@ -647,7 +649,7 @@ func (m *Manager) buildInitRequest(
 	if err != nil {
 		return nil, fmt.Errorf("marshal physical client config: %w", err)
 	}
-	convertedControlPlaneConfig, err := kubeconfig.ConvertRestConfigToClientConfig(vConfig.ControlPlaneConfig)
+	convertedControlPlaneConfig, err := kubeconfig.ConvertRestConfigToClientConfig(vConfig.HostConfig)
 	if err != nil {
 		return nil, fmt.Errorf("convert control plane client config: %w", err)
 	}
@@ -679,7 +681,7 @@ func (m *Manager) buildInitRequest(
 		ControlPlaneConfig: controlPlaneConfigBytes,
 
 		SyncerConfig:     syncerConfigBytes,
-		CurrentNamespace: vConfig.WorkloadNamespace,
+		CurrentNamespace: vConfig.HostNamespace,
 		Config:           encodedConfig,
 		Options:          encodedLegacyOptions,
 		WorkingDir:       workingDir,

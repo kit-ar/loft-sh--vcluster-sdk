@@ -6,35 +6,11 @@ import (
 	"strings"
 
 	vclusterconfig "github.com/loft-sh/vcluster/config"
-	"github.com/loft-sh/vcluster/pkg/config"
-	"github.com/loft-sh/vcluster/pkg/controllers/deploy"
-	"github.com/loft-sh/vcluster/pkg/controllers/generic"
-	"github.com/loft-sh/vcluster/pkg/controllers/resources/configmaps"
-	"github.com/loft-sh/vcluster/pkg/controllers/resources/csidrivers"
-	"github.com/loft-sh/vcluster/pkg/controllers/resources/csinodes"
-	"github.com/loft-sh/vcluster/pkg/controllers/resources/csistoragecapacities"
-	"github.com/loft-sh/vcluster/pkg/controllers/resources/endpoints"
-	"github.com/loft-sh/vcluster/pkg/controllers/resources/events"
-	"github.com/loft-sh/vcluster/pkg/controllers/resources/ingressclasses"
-	"github.com/loft-sh/vcluster/pkg/controllers/resources/ingresses"
-	"github.com/loft-sh/vcluster/pkg/controllers/resources/namespaces"
-	"github.com/loft-sh/vcluster/pkg/controllers/resources/networkpolicies"
-	"github.com/loft-sh/vcluster/pkg/controllers/resources/nodes"
-	"github.com/loft-sh/vcluster/pkg/controllers/resources/persistentvolumeclaims"
-	"github.com/loft-sh/vcluster/pkg/controllers/resources/persistentvolumes"
-	"github.com/loft-sh/vcluster/pkg/controllers/resources/poddisruptionbudgets"
-	"github.com/loft-sh/vcluster/pkg/controllers/resources/pods"
-	"github.com/loft-sh/vcluster/pkg/controllers/resources/priorityclasses"
-	"github.com/loft-sh/vcluster/pkg/controllers/resources/secrets"
-	"github.com/loft-sh/vcluster/pkg/controllers/resources/serviceaccounts"
-	"github.com/loft-sh/vcluster/pkg/controllers/resources/storageclasses"
-	"github.com/loft-sh/vcluster/pkg/controllers/resources/volumesnapshots/volumesnapshotclasses"
-	"github.com/loft-sh/vcluster/pkg/controllers/resources/volumesnapshots/volumesnapshotcontents"
-	"github.com/loft-sh/vcluster/pkg/controllers/resources/volumesnapshots/volumesnapshots"
 	"github.com/loft-sh/vcluster/pkg/controllers/servicesync"
-	"github.com/loft-sh/vcluster/pkg/controllers/syncer"
+	"github.com/loft-sh/vcluster/pkg/syncer"
+	"github.com/loft-sh/vcluster/pkg/syncer/synccontext"
+	syncertypes "github.com/loft-sh/vcluster/pkg/syncer/types"
 	"github.com/loft-sh/vcluster/pkg/util/blockingcacheclient"
-	util "github.com/loft-sh/vcluster/pkg/util/context"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/rest"
@@ -44,147 +20,54 @@ import (
 	"github.com/loft-sh/vcluster/pkg/controllers/coredns"
 	"github.com/loft-sh/vcluster/pkg/controllers/k8sdefaultendpoint"
 	"github.com/loft-sh/vcluster/pkg/controllers/podsecurity"
-	"github.com/loft-sh/vcluster/pkg/controllers/resources/services"
-	synccontext "github.com/loft-sh/vcluster/pkg/controllers/syncer/context"
-	syncertypes "github.com/loft-sh/vcluster/pkg/types"
+	"github.com/loft-sh/vcluster/pkg/snapshot"
+	csiVolumeSnapshots "github.com/loft-sh/vcluster/pkg/snapshot/volumes/csi/deploy"
 	"github.com/loft-sh/vcluster/pkg/util/loghelper"
 	"github.com/pkg/errors"
-	"golang.org/x/sync/errgroup"
 )
 
-type initFunction func(*synccontext.RegisterContext) (syncertypes.Object, error)
+func RegisterControllers(ctx *synccontext.ControllerContext, syncers []syncertypes.Object) error {
+	registerContext := ctx.ToRegisterContext()
 
-func getSyncers(ctx *config.ControllerContext) []initFunction {
-	return []initFunction{
-		isEnabled(ctx.Config.Sync.ToHost.Services.Enabled, services.New),
-		isEnabled(ctx.Config.Sync.ToHost.ConfigMaps.Enabled, configmaps.New),
-		isEnabled(ctx.Config.Sync.ToHost.Secrets.Enabled, secrets.New),
-		isEnabled(ctx.Config.Sync.ToHost.Endpoints.Enabled, endpoints.New),
-		isEnabled(ctx.Config.Sync.ToHost.Pods.Enabled, pods.New),
-		isEnabled(ctx.Config.Sync.FromHost.Events.Enabled, events.New),
-		isEnabled(ctx.Config.Sync.ToHost.PersistentVolumeClaims.Enabled, persistentvolumeclaims.New),
-		isEnabled(ctx.Config.Sync.ToHost.Ingresses.Enabled, ingresses.New),
-		isEnabled(ctx.Config.Sync.FromHost.IngressClasses.Enabled, ingressclasses.New),
-		isEnabled(ctx.Config.Sync.ToHost.StorageClasses.Enabled, storageclasses.New),
-		isEnabled(ctx.Config.Sync.FromHost.StorageClasses.Enabled == "true", storageclasses.NewHostStorageClassSyncer),
-		isEnabled(ctx.Config.Sync.ToHost.PriorityClasses.Enabled, priorityclasses.New),
-		isEnabled(ctx.Config.Sync.ToHost.PodDisruptionBudgets.Enabled, poddisruptionbudgets.New),
-		isEnabled(ctx.Config.Sync.ToHost.NetworkPolicies.Enabled, networkpolicies.New),
-		isEnabled(ctx.Config.Sync.ToHost.VolumeSnapshots.Enabled, volumesnapshotclasses.New),
-		isEnabled(ctx.Config.Sync.ToHost.VolumeSnapshots.Enabled, volumesnapshots.New),
-		isEnabled(ctx.Config.Sync.ToHost.VolumeSnapshots.Enabled, volumesnapshotcontents.New),
-		isEnabled(ctx.Config.Sync.ToHost.ServiceAccounts.Enabled, serviceaccounts.New),
-		isEnabled(ctx.Config.Sync.FromHost.CSINodes.Enabled == "true", csinodes.New),
-		isEnabled(ctx.Config.Sync.FromHost.CSIDrivers.Enabled == "true", csidrivers.New),
-		isEnabled(ctx.Config.Sync.FromHost.CSIStorageCapacities.Enabled == "true", csistoragecapacities.New),
-		isEnabled(ctx.Config.Experimental.MultiNamespaceMode.Enabled, namespaces.New),
-		persistentvolumes.New,
-		nodes.New,
-	}
-}
-
-func isEnabled(enabled bool, fn initFunction) initFunction {
-	if enabled {
-		return fn
-	}
-	return nil
-}
-
-func Create(ctx *config.ControllerContext) ([]syncertypes.Object, error) {
-	registerContext := util.ToRegisterContext(ctx)
-
-	// register controllers for resource synchronization
-	syncers := []syncertypes.Object{}
-	for _, newSyncer := range getSyncers(ctx) {
-		if newSyncer == nil {
-			continue
-		}
-
-		createdController, err := newSyncer(registerContext)
-		if err != nil {
-			return nil, errors.Wrapf(err, "register %s controller", createdController.Name())
-		}
-
-		loghelper.Infof("Start %s sync controller", createdController.Name())
-		syncers = append(syncers, createdController)
-	}
-
-	return syncers, nil
-}
-
-func ExecuteInitializers(controllerCtx *config.ControllerContext, syncers []syncertypes.Object) error {
-	registerContext := util.ToRegisterContext(controllerCtx)
-
-	// execute in parallel because each one might be time-consuming
-	errorGroup, ctx := errgroup.WithContext(controllerCtx.Context)
-	registerContext.Context = ctx
-	for _, s := range syncers {
-		name := s.Name()
-		initializer, ok := s.(syncertypes.Initializer)
-		if ok {
-			errorGroup.Go(func() error {
-				err := initializer.Init(registerContext)
-				if err != nil {
-					return errors.Wrapf(err, "ensure prerequisites for %s syncer", name)
-				}
-				return nil
-			})
-		}
-	}
-
-	return errorGroup.Wait()
-}
-
-func RegisterIndices(ctx *config.ControllerContext, syncers []syncertypes.Object) error {
-	registerContext := util.ToRegisterContext(ctx)
-	for _, s := range syncers {
-		indexRegisterer, ok := s.(syncertypes.IndicesRegisterer)
-		if ok {
-			err := indexRegisterer.RegisterIndices(registerContext)
-			if err != nil {
-				return errors.Wrapf(err, "register indices for %s syncer", s.Name())
-			}
-		}
-	}
-
-	return nil
-}
-
-func RegisterControllers(ctx *config.ControllerContext, syncers []syncertypes.Object) error {
-	registerContext := util.ToRegisterContext(ctx)
-
-	err := k8sdefaultendpoint.Register(ctx)
+	// register controller that keeps CoreDNS NodeHosts config up to date
+	err := registerCoreDNSController(ctx)
 	if err != nil {
 		return err
 	}
 
 	// register controller that maintains pod security standard check
 	if ctx.Config.Policies.PodSecurityStandard != "" {
-		err := RegisterPodSecurityController(ctx)
+		err := registerPodSecurityController(ctx)
 		if err != nil {
 			return err
 		}
 	}
 
-	// register controller that keeps CoreDNS NodeHosts config up to date
-	err = RegisterCoreDNSController(ctx)
-	if err != nil {
-		return err
+	if !ctx.Config.ControlPlane.Standalone.Enabled {
+		// register vcluster snapshot & restore controllers only for non-standalone
+		err = registerSnapshotController(registerContext)
+		if err != nil {
+			return err
+		}
+		err = registerRestoreController(registerContext)
+		if err != nil {
+			return err
+		}
 	}
 
-	// register init manifests configmap watcher controller
-	err = deploy.RegisterInitManifestsController(ctx)
+	// skip if we run in dedicated mode
+	if ctx.Config.PrivateNodes.Enabled {
+		return nil
+	}
+
+	// start default endpoint controller
+	err = k8sdefaultendpoint.Register(ctx)
 	if err != nil {
 		return err
 	}
 
 	// register service syncer to map services between host and virtual cluster
-	err = RegisterServiceSyncControllers(ctx)
-	if err != nil {
-		return err
-	}
-
-	err = RegisterGenericSyncController(ctx)
+	err = registerServiceSyncControllers(ctx)
 	if err != nil {
 		return err
 	}
@@ -198,16 +81,23 @@ func RegisterControllers(ctx *config.ControllerContext, syncers []syncertypes.Ob
 			if err != nil {
 				return errors.Wrapf(err, "start %s syncer", v.Name())
 			}
-		} else {
-			// real syncer?
-			realSyncer, ok := v.(syncertypes.Syncer)
-			if ok {
-				err = syncer.RegisterSyncer(registerContext, realSyncer)
-				if err != nil {
-					return errors.Wrapf(err, "start %s syncer", v.Name())
-				}
-			} else {
-				return fmt.Errorf("syncer %s does not implement fake syncer or syncer interface", v.Name())
+		}
+
+		// real syncer?
+		realSyncer, ok := v.(syncertypes.Syncer)
+		if ok {
+			err = syncer.RegisterSyncer(registerContext, realSyncer)
+			if err != nil {
+				return errors.Wrapf(err, "start %s syncer", v.Name())
+			}
+		}
+
+		// custom syncer?
+		customSyncer, ok := v.(syncertypes.ControllerStarter)
+		if ok {
+			err = customSyncer.Register(registerContext)
+			if err != nil {
+				return errors.Wrapf(err, "start %s syncer", v.Name())
 			}
 		}
 	}
@@ -215,25 +105,8 @@ func RegisterControllers(ctx *config.ControllerContext, syncers []syncertypes.Ob
 	return nil
 }
 
-func RegisterGenericSyncController(ctx *config.ControllerContext) error {
-	err := generic.CreateExporters(ctx)
-	if err != nil {
-		return err
-	}
-
-	err = generic.CreateImporters(ctx)
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func RegisterServiceSyncControllers(ctx *config.ControllerContext) error {
-	hostNamespace := ctx.Config.WorkloadTargetNamespace
-	if ctx.Config.Experimental.MultiNamespaceMode.Enabled {
-		hostNamespace = ctx.Config.WorkloadNamespace
-	}
+func registerServiceSyncControllers(ctx *synccontext.ControllerContext) error {
+	hostNamespace := ctx.Config.HostNamespace
 
 	if len(ctx.Config.Networking.ReplicateServices.FromHost) > 0 {
 		mapping, err := parseMapping(ctx.Config.Networking.ReplicateServices.FromHost, hostNamespace, "")
@@ -243,10 +116,10 @@ func RegisterServiceSyncControllers(ctx *config.ControllerContext) error {
 
 		// sync we are syncing from arbitrary physical namespaces we need to create a new
 		// manager that listens on global services
-		globalLocalManager, err := ctrl.NewManager(ctx.LocalManager.GetConfig(), ctrl.Options{
-			Scheme: ctx.LocalManager.GetScheme(),
+		globalLocalManager, err := ctrl.NewManager(ctx.HostManager.GetConfig(), ctrl.Options{
+			Scheme: ctx.HostManager.GetScheme(),
 			MapperProvider: func(_ *rest.Config, _ *http.Client) (meta.RESTMapper, error) {
-				return ctx.LocalManager.GetRESTMapper(), nil
+				return ctx.HostManager.GetRESTMapper(), nil
 			},
 			Metrics:        metricsserver.Options{BindAddress: "0"},
 			LeaderElection: false,
@@ -255,26 +128,32 @@ func RegisterServiceSyncControllers(ctx *config.ControllerContext) error {
 		if err != nil {
 			return err
 		}
+		if globalLocalManager == nil {
+			return errors.New("nil globalLocalManager")
+		}
 
 		// start the manager
 		go func() {
-			err := globalLocalManager.Start(ctx.Context)
+			err := globalLocalManager.Start(ctx)
 			if err != nil {
 				panic(err)
 			}
 		}()
 
 		// Wait for caches to be synced
-		globalLocalManager.GetCache().WaitForCacheSync(ctx.Context)
+		globalLocalManager.GetCache().WaitForCacheSync(ctx)
 
 		// register controller
+		name := "map-host-service-syncer"
 		controller := &servicesync.ServiceSyncer{
+			Name:            name,
+			SyncContext:     ctx.ToRegisterContext().ToSyncContext(name),
 			SyncServices:    mapping,
 			CreateNamespace: true,
 			CreateEndpoints: true,
 			From:            globalLocalManager,
 			To:              ctx.VirtualManager,
-			Log:             loghelper.New("map-host-service-syncer"),
+			Log:             loghelper.New(name),
 		}
 		err = controller.Register()
 		if err != nil {
@@ -287,16 +166,18 @@ func RegisterServiceSyncControllers(ctx *config.ControllerContext) error {
 		if err != nil {
 			return errors.Wrap(err, "parse physical service mapping")
 		}
-
+		name := "map-virtual-service-syncer"
 		controller := &servicesync.ServiceSyncer{
+			Name:                  name,
+			SyncContext:           ctx.ToRegisterContext().ToSyncContext(name),
 			SyncServices:          mapping,
 			IsVirtualToHostSyncer: true,
 			From:                  ctx.VirtualManager,
-			To:                    ctx.LocalManager,
-			Log:                   loghelper.New("map-virtual-service-syncer"),
+			To:                    ctx.HostManager,
+			Log:                   loghelper.New(name),
 		}
 
-		if ctx.Config.Experimental.MultiNamespaceMode.Enabled {
+		if ctx.Config.Sync.ToHost.Namespaces.Enabled {
 			controller.CreateEndpoints = true
 		}
 
@@ -353,7 +234,7 @@ func parseMapping(mappings []vclusterconfig.ServiceMapping, fromDefaultNamespace
 	return ret, nil
 }
 
-func RegisterCoreDNSController(ctx *config.ControllerContext) error {
+func registerCoreDNSController(ctx *synccontext.ControllerContext) error {
 	controller := &coredns.NodeHostsReconciler{
 		Client: ctx.VirtualManager.GetClient(),
 		Log:    loghelper.New("corednsnodehosts-controller"),
@@ -365,7 +246,7 @@ func RegisterCoreDNSController(ctx *config.ControllerContext) error {
 	return nil
 }
 
-func RegisterPodSecurityController(ctx *config.ControllerContext) error {
+func registerPodSecurityController(ctx *synccontext.ControllerContext) error {
 	controller := &podsecurity.Reconciler{
 		Client:              ctx.VirtualManager.GetClient(),
 		PodSecurityStandard: ctx.Config.Policies.PodSecurityStandard,
@@ -375,5 +256,39 @@ func RegisterPodSecurityController(ctx *config.ControllerContext) error {
 	if err != nil {
 		return fmt.Errorf("unable to setup pod security controller: %w", err)
 	}
+	return nil
+}
+
+func registerSnapshotController(registerContext *synccontext.RegisterContext) error {
+	controller, err := snapshot.NewController(registerContext)
+	if err != nil {
+		return fmt.Errorf("unable to create vcluster snapshot controller: %w", err)
+	}
+	err = controller.Register()
+	if err != nil {
+		return fmt.Errorf("unable to register vcluster snapshot controller: %w", err)
+	}
+
+	config := registerContext.Config
+	if config.PrivateNodes.Enabled && config.Deploy.VolumeSnapshotController.Enabled {
+		err = csiVolumeSnapshots.Deploy(registerContext)
+		if err != nil {
+			return fmt.Errorf("unable to deploy required CSI volume snapshot compoments: %w", err)
+		}
+	}
+
+	return nil
+}
+
+func registerRestoreController(registerContext *synccontext.RegisterContext) error {
+	controller, err := snapshot.NewRestoreController(registerContext)
+	if err != nil {
+		return fmt.Errorf("unable to create vcluster snapshot controller: %w", err)
+	}
+	err = controller.Register()
+	if err != nil {
+		return fmt.Errorf("unable to register vcluster snapshot controller: %w", err)
+	}
+
 	return nil
 }
