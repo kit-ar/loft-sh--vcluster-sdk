@@ -37,10 +37,10 @@ jobs:
             context: ./examples/import-secrets
             dockerfile: ./examples/import-secrets/Dockerfile
             tag: loft-sh--vcluster-import-secrets
-          - name: crd-sync
-            context: ./examples/crd-sync
-            dockerfile: ./examples/crd-sync/Dockerfile
-            tag: loft-sh--vcluster-crd-sync
+#          - name: crd-sync
+#            context: ./examples/crd-sync
+#            dockerfile: ./examples/crd-sync/Dockerfile
+#            tag: loft-sh--vcluster-crd-sync
 
     permissions:
       id-token: write # This is the key for OIDC cosign!
@@ -72,7 +72,8 @@ jobs:
         with:
           file: ${{ matrix.example.dockerfile }}
           context: ${{ matrix.example.context }}
-          platforms: linux/amd64,linux/arm64
+#          platforms: linux/amd64,linux/arm64
+          platforms: linux/amd64
           push: true
           tags: "ghcr.io/kit-ar/${{ matrix.example.tag }}:${{ needs.setup.outputs.version }}"
           labels: ${{ needs.setup.outputs.docker_labels }}
