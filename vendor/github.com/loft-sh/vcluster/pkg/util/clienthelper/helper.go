@@ -6,33 +6,18 @@ import (
 	"os"
 	"reflect"
 
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apiserver/pkg/authentication/user"
 	"k8s.io/client-go/rest"
 
 	authenticationv1 "k8s.io/api/authentication/v1"
 	authorizationv1 "k8s.io/api/authorization/v1"
-	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
-	apiregistrationv1 "k8s.io/kube-aggregator/pkg/apis/apiregistration/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
-
-var (
-	DefaultScheme = runtime.NewScheme()
-)
-
-func init() {
-	_ = clientgoscheme.AddToScheme(DefaultScheme)
-	// API extensions are not in the above scheme set,
-	// and must thus be added separately.
-	_ = authenticationv1.AddToScheme(DefaultScheme)
-	_ = apiextensionsv1.AddToScheme(DefaultScheme)
-	_ = apiregistrationv1.AddToScheme(DefaultScheme)
-}
 
 func CurrentNamespace() (string, error) {
 	namespaceEnv := os.Getenv("NAMESPACE")
@@ -74,8 +59,14 @@ func GetByIndex(ctx context.Context, c client.Client, obj runtime.Object, index,
 
 	list, err := c.Scheme().New(gvk.GroupVersion().WithKind(gvk.Kind + "List"))
 	if err != nil {
-		// TODO: handle runtime.IsNotRegisteredError(err)
-		return err
+		if !runtime.IsNotRegisteredError(err) {
+			return err
+		}
+
+		unstructuredList := &unstructured.UnstructuredList{}
+		unstructuredList.SetKind(gvk.Kind + "List")
+		unstructuredList.SetAPIVersion(gvk.GroupVersion().String())
+		list = unstructuredList
 	}
 
 	err = c.List(ctx, list.(client.ObjectList), client.MatchingFields{index: value})
@@ -127,4 +118,12 @@ func NewImpersonatingClient(config *rest.Config, mapper meta.RESTMapper, user us
 
 	// Create client
 	return client.New(restConfig, client.Options{Scheme: scheme, Mapper: mapper})
+}
+
+func IsNilObject(obj any) bool {
+	if obj == nil || (reflect.ValueOf(obj).IsValid() && reflect.ValueOf(obj).IsNil()) {
+		return true
+	}
+
+	return false
 }

@@ -4,9 +4,10 @@ import (
 	"context"
 	"net/http"
 
-	synccontext "github.com/loft-sh/vcluster/pkg/controllers/syncer/context"
+	"github.com/loft-sh/vcluster/pkg/mappings/resources"
 	v2 "github.com/loft-sh/vcluster/pkg/plugin/v2"
-	syncertypes "github.com/loft-sh/vcluster/pkg/types"
+	"github.com/loft-sh/vcluster/pkg/syncer/synccontext"
+	syncertypes "github.com/loft-sh/vcluster/pkg/syncer/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	ctrlmanager "sigs.k8s.io/controller-runtime/pkg/manager"
 )
@@ -17,6 +18,9 @@ type Options struct {
 
 	// ModifyHostManager modifies options for the host manager
 	ModifyHostManager func(options *ctrlmanager.Options)
+
+	// RegisterMappings will start the default mappings
+	RegisterMappings []resources.BuildMapper
 }
 
 type Manager interface {
@@ -36,6 +40,12 @@ type Manager interface {
 	// the functionality if the current vcluster pod is the current leader and
 	// will stop if the pod will lose leader election.
 	Start() error
+
+	// Start runs all the registered syncers and will not block. It only executes
+	// the functionality if the current vcluster pod is the current leader
+	// You need to exit the plugin when the channel is closed since that means you lost
+	// leader election
+	StartAsync() (<-chan struct{}, error)
 
 	// UnmarshalConfig retrieves the plugin config from environment and parses it into
 	// the given object.

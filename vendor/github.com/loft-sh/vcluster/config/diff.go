@@ -5,6 +5,7 @@ import (
 	"errors"
 	"reflect"
 	"strconv"
+	"strings"
 
 	"sigs.k8s.io/yaml"
 )
@@ -67,6 +68,12 @@ func diff(from, to any) any {
 				// if its an int, its 3 -> 0
 				case int:
 					retMap[k] = 0
+				// if its an int, its 3 -> 0
+				case int64:
+					retMap[k] = int64(0)
+				// if its an int, its 3 -> 0
+				case float64:
+					retMap[k] = float64(0)
 				}
 			} else if !reflect.DeepEqual(fromValue, toValue) {
 				switch fromValue.(type) {
@@ -106,14 +113,16 @@ func prune(in interface{}) interface{} {
 
 		for k, v := range inType {
 			inType[k] = prune(v)
-			if inType[k] == nil {
+			// delete key only if original value was not nil (but for example empty map),
+			// otherwise we want to keep null as a value
+			if inType[k] == nil && v != nil {
 				delete(inType, k)
 			}
 		}
-
 		if len(inType) == 0 {
 			return nil
 		}
+
 		return inType
 	default:
 		return in
@@ -157,4 +166,11 @@ func (f *StrBool) MarshalJSON() ([]byte, error) {
 	default:
 		return []byte("\"" + *f + "\""), nil
 	}
+}
+
+func (f *StrBool) Bool() bool {
+	if f == nil {
+		return false
+	}
+	return strings.ToLower(string(*f)) == "true"
 }

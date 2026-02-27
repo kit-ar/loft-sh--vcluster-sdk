@@ -2,6 +2,7 @@ package k3s
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -39,7 +40,7 @@ func StartK3S(ctx context.Context, vConfig *config.VirtualClusterConfig, service
 		args = append(args, "--egress-selector-mode=disabled")
 		args = append(args, "--flannel-backend=none")
 		args = append(args, "--kube-apiserver-arg=bind-address=127.0.0.1")
-		if vConfig.ControlPlane.Advanced.VirtualScheduler.Enabled {
+		if vConfig.IsVirtualSchedulerEnabled() {
 			args = append(args, "--kube-controller-manager-arg=controllers=*,-nodeipam,-persistentvolume-binder,-attachdetach,-persistentvolume-expander,-cloud-node-lifecycle,-ttl")
 			args = append(args, "--kube-apiserver-arg=endpoint-reconciler-type=none")
 			args = append(args, "--kube-controller-manager-arg=node-monitor-grace-period=1h")
@@ -50,20 +51,44 @@ func StartK3S(ctx context.Context, vConfig *config.VirtualClusterConfig, service
 			args = append(args, "--kube-apiserver-arg=endpoint-reconciler-type=none")
 		}
 		if vConfig.ControlPlane.BackingStore.Etcd.Deploy.Enabled {
+			var etcdEndpoint string
+			if vConfig.ControlPlane.BackingStore.Etcd.Deploy.Service.Enabled {
+				etcdEndpoint = "https://" + vConfig.Name + "-etcd:2379"
+			} else {
+				etcdEndpoint = "https://" + vConfig.Name + "-etcd-headless:2379"
+			}
+
 			// wait until etcd is up and running
-			_, err := etcd.WaitForEtcdClient(ctx, &etcd.Certificates{
+			err := etcd.WaitForEtcd(ctx, &etcd.Certificates{
 				CaCert:     "/data/pki/etcd/ca.crt",
 				ServerCert: "/data/pki/apiserver-etcd-client.crt",
 				ServerKey:  "/data/pki/apiserver-etcd-client.key",
-			}, "https://"+vConfig.Name+"-etcd:2379")
+			}, etcdEndpoint)
 			if err != nil {
 				return err
 			}
 
-			args = append(args, "--datastore-endpoint=https://"+vConfig.Name+"-etcd:2379")
+			args = append(args, "--datastore-endpoint="+etcdEndpoint)
 			args = append(args, "--datastore-cafile=/data/pki/etcd/ca.crt")
 			args = append(args, "--datastore-certfile=/data/pki/apiserver-etcd-client.crt")
 			args = append(args, "--datastore-keyfile=/data/pki/apiserver-etcd-client.key")
+		} else if vConfig.ControlPlane.BackingStore.Etcd.External.Enabled {
+			etcdEndpoint := "https://" + strings.TrimPrefix(vConfig.ControlPlane.BackingStore.Etcd.External.Endpoint, "https://")
+
+			// wait until etcd is up and running
+			err := etcd.WaitForEtcd(ctx, &etcd.Certificates{
+				CaCert:     vConfig.ControlPlane.BackingStore.Etcd.External.TLS.CaFile,
+				ServerCert: vConfig.ControlPlane.BackingStore.Etcd.External.TLS.CertFile,
+				ServerKey:  vConfig.ControlPlane.BackingStore.Etcd.External.TLS.KeyFile,
+			}, etcdEndpoint)
+			if err != nil {
+				return err
+			}
+
+			args = append(args, "--datastore-endpoint="+etcdEndpoint)
+			args = append(args, "--datastore-cafile="+vConfig.ControlPlane.BackingStore.Etcd.External.TLS.CaFile)
+			args = append(args, "--datastore-certfile="+vConfig.ControlPlane.BackingStore.Etcd.External.TLS.CertFile)
+			args = append(args, "--datastore-keyfile="+vConfig.ControlPlane.BackingStore.Etcd.External.TLS.KeyFile)
 		} else if vConfig.ControlPlane.BackingStore.Etcd.Embedded.Enabled {
 			args = append(args, "--datastore-endpoint=https://localhost:2379")
 			args = append(args, "--datastore-cafile=/data/pki/etcd/ca.crt")
@@ -110,6 +135,13 @@ func StartK3S(ctx context.Context, vConfig *config.VirtualClusterConfig, service
 }
 
 func EnsureK3SToken(ctx context.Context, currentNamespaceClient kubernetes.Interface, currentNamespace, vClusterName string, options *config.VirtualClusterConfig) (string, error) {
+	if currentNamespaceClient == nil {
+		return "", errors.New("nil currentNamespaceClient")
+	}
+	if options == nil {
+		return "", errors.New("nil options")
+	}
+
 	// check if token is set externally
 	if options.ControlPlane.Distro.K3S.Token != "" {
 		return options.ControlPlane.Distro.K3S.Token, nil

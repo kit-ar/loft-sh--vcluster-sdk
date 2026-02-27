@@ -2,15 +2,15 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
-	"github.com/loft-sh/loftctl/v4/cmd/loftctl/cmd/use"
-	"github.com/loft-sh/loftctl/v4/pkg/vcluster"
 	"github.com/loft-sh/log"
 	"github.com/loft-sh/vcluster/pkg/cli/find"
 	"github.com/loft-sh/vcluster/pkg/cli/flags"
 	"github.com/loft-sh/vcluster/pkg/platform"
-	"github.com/loft-sh/vcluster/pkg/util/clihelper"
+	"github.com/loft-sh/vcluster/pkg/platform/clihelper"
+	"github.com/loft-sh/vcluster/pkg/util/serviceaccount"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/clientcmd"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
@@ -24,7 +24,7 @@ type connectPlatform struct {
 }
 
 func ConnectPlatform(ctx context.Context, options *ConnectOptions, globalFlags *flags.GlobalFlags, vClusterName string, command []string, log log.Logger) error {
-	platformClient, err := platform.CreatePlatformClient()
+	platformClient, err := platform.InitClientFromConfig(ctx, globalFlags.LoadedConfig(log))
 	if err != nil {
 		return err
 	}
@@ -33,6 +33,9 @@ func ConnectPlatform(ctx context.Context, options *ConnectOptions, globalFlags *
 	vCluster, err := find.GetPlatformVCluster(ctx, platformClient, vClusterName, options.Project, log)
 	if err != nil {
 		return fmt.Errorf("get platform vcluster %s: %w", vClusterName, err)
+	}
+	if vCluster == nil {
+		return errors.New("empty vCluster")
 	}
 
 	// create connect platform command
@@ -55,13 +58,21 @@ func ConnectPlatform(ctx context.Context, options *ConnectOptions, globalFlags *
 	}
 
 	// wait for vCluster to become ready
-	vCluster.VirtualCluster, err = vcluster.WaitForVirtualClusterInstance(ctx, managementClient, vCluster.VirtualCluster.Namespace, vCluster.VirtualCluster.Name, true, log)
+	if vCluster.VirtualCluster == nil {
+		return errors.New("nil virtual cluster object")
+	}
+
+	vc, err := platform.WaitForVirtualClusterInstance(ctx, managementClient, vCluster.VirtualCluster.Namespace, vCluster.VirtualCluster.Name, true, log)
 	if err != nil {
 		return err
 	}
+	vCluster.VirtualCluster = vc
+	if vCluster.VirtualCluster == nil {
+		return errors.New("platform returned empty virtual cluster")
+	}
 
 	// retrieve vCluster kube config
-	kubeConfig, err := cmd.getVClusterKubeConfig(ctx, platformClient, vCluster)
+	kubeConfig, err := cmd.getVClusterKubeConfig(ctx, platformClient, globalFlags, vCluster)
 	if err != nil {
 		return err
 	}
@@ -81,9 +92,6 @@ func (cmd *connectPlatform) validateProFlags() error {
 	if cmd.Server != "" {
 		return fmt.Errorf("cannot use --server with a pro vCluster")
 	}
-	if cmd.BackgroundProxy {
-		return fmt.Errorf("cannot use --background-proxy with a pro vCluster")
-	}
 	if cmd.LocalPort != 0 {
 		return fmt.Errorf("cannot use --local-port with a pro vCluster")
 	}
@@ -94,15 +102,19 @@ func (cmd *connectPlatform) validateProFlags() error {
 	return nil
 }
 
-func (cmd *connectPlatform) getVClusterKubeConfig(ctx context.Context, platformClient platform.Client, vCluster *platform.VirtualClusterInstanceProject) (*clientcmdapi.Config, error) {
-	contextOptions, err := use.CreateVirtualClusterInstanceOptions(ctx, platformClient, "", vCluster.Project.Name, vCluster.VirtualCluster, false, false, cmd.log)
+func (cmd *connectPlatform) getVClusterKubeConfig(ctx context.Context, platformClient platform.Client, globalFlags *flags.GlobalFlags, vCluster *platform.VirtualClusterInstanceProject) (*clientcmdapi.Config, error) {
+	if vCluster == nil || vCluster.Project == nil || vCluster.VirtualCluster == nil {
+		return nil, errors.New("invalid vcluster VirtualClusterInstanceProject object")
+	}
+
+	contextOptions, err := platform.CreateVirtualClusterInstanceOptions(ctx, platformClient, globalFlags.Config, vCluster.Project.Name, vCluster.VirtualCluster, false)
 	if err != nil {
 		return nil, fmt.Errorf("prepare vCluster kube config: %w", err)
 	}
 
 	// make sure access key is set
-	if contextOptions.Token == "" && len(contextOptions.ClientCertificateData) == 0 && len(contextOptions.ClientKeyData) == 0 {
-		contextOptions.Token = platformClient.Config().AccessKey
+	if contextOptions.Token == "" {
+		contextOptions.Token = platformClient.Config().Platform.AccessKey
 	}
 
 	// get current context
@@ -145,8 +157,14 @@ func (cmd *connectPlatform) getVClusterKubeConfig(ctx context.Context, platformC
 			return nil, fmt.Errorf("forward token is not enabled on the virtual cluster and hence you cannot authenticate with a service account token")
 		}
 
+		// init client
+		vKubeClient, serviceAccount, serviceAccountNamespace, err := getServiceAccountClientAndName(*kubeConfig, cmd.ConnectOptions)
+		if err != nil {
+			return nil, err
+		}
+
 		// create service account token
-		token, err := createServiceAccountToken(ctx, *kubeConfig, cmd.ConnectOptions, cmd.log)
+		token, err := serviceaccount.CreateServiceAccountToken(ctx, vKubeClient, serviceAccount, serviceAccountNamespace, cmd.ServiceAccountClusterRole, int64(cmd.ServiceAccountExpiration), cmd.log)
 		if err != nil {
 			return nil, err
 		}

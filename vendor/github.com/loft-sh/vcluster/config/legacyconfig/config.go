@@ -4,7 +4,7 @@ import (
 	"github.com/loft-sh/vcluster/config"
 )
 
-type LegacyK0sAndK3s struct {
+type LegacyK3s struct {
 	BaseHelm
 	AutoDeletePersistentVolumeClaims bool               `json:"autoDeletePersistentVolumeClaims,omitempty"`
 	K3sToken                         string             `json:"k3sToken,omitempty"`
@@ -14,7 +14,7 @@ type LegacyK0sAndK3s struct {
 	Storage                          Storage            `json:"storage,omitempty"`
 }
 
-func (c *LegacyK0sAndK3s) UnmarshalYAMLStrict(data []byte) error {
+func (c *LegacyK3s) UnmarshalYAMLStrict(data []byte) error {
 	return config.UnmarshalYAMLStrict(data, c)
 }
 
@@ -85,9 +85,10 @@ type EmbeddedEtcdValues struct {
 }
 
 type Storage struct {
-	Persistence *bool  `json:"persistence,omitempty"`
-	Size        string `json:"size,omitempty"`
-	ClassName   string `json:"className,omitempty"`
+	Persistence    *bool                    `json:"persistence,omitempty"`
+	Size           string                   `json:"size,omitempty"`
+	ClassName      string                   `json:"className,omitempty"`
+	BinariesVolume []map[string]interface{} `json:"binariesVolume,omitempty"`
 }
 
 type BaseHelm struct {
@@ -266,22 +267,22 @@ type RBACRoleValues struct {
 
 type RBACRule struct {
 	// Verbs is a list of Verbs that apply to ALL the ResourceKinds contained in this rule. '*' represents all verbs.
-	Verbs []string `json:"verbs" protobuf:"bytes,1,rep,name=verbs"`
+	Verbs []string `protobuf:"bytes,1,rep,name=verbs" json:"verbs"`
 	// APIGroups is the name of the APIGroup that contains the resources.  If multiple API groups are specified, any action requested against one of
 	// the enumerated resources in any API group will be allowed. "" represents the core API group and "*" represents all API groups.
 	// +optional
-	APIGroups []string `json:"apiGroups,omitempty" protobuf:"bytes,2,rep,name=apiGroups"`
+	APIGroups []string `protobuf:"bytes,2,rep,name=apiGroups" json:"apiGroups,omitempty"`
 	// Resources is a list of resources this rule applies to. '*' represents all resources.
 	// +optional
-	Resources []string `json:"resources,omitempty" protobuf:"bytes,3,rep,name=resources"`
+	Resources []string `protobuf:"bytes,3,rep,name=resources" json:"resources,omitempty"`
 	// ResourceNames is an optional white list of names that the rule applies to.  An empty set means that everything is allowed.
 	// +optional
-	ResourceNames []string `json:"resourceNames,omitempty" protobuf:"bytes,4,rep,name=resourceNames"`
+	ResourceNames []string `protobuf:"bytes,4,rep,name=resourceNames" json:"resourceNames,omitempty"`
 	// NonResourceURLs is a set of partial urls that a user should have access to.  *s are allowed, but only as the full, final step in the path
 	// Since non-resource URLs are not namespaced, this field is only applicable for ClusterRoles referenced from a ClusterRoleBinding.
 	// Rules can either apply to API resources (such as "pods" or "secrets") or non-resource URL paths (such as "/api"),  but not both.
 	// +optional
-	NonResourceURLs []string `json:"nonResourceURLs,omitempty" protobuf:"bytes,5,rep,name=nonResourceURLs"`
+	NonResourceURLs []string `protobuf:"bytes,5,rep,name=nonResourceURLs" json:"nonResourceURLs,omitempty"`
 }
 
 type PDBValues struct {

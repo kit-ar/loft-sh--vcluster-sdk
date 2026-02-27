@@ -10,7 +10,6 @@ import (
 	"github.com/onsi/gomega"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 )
@@ -28,7 +27,7 @@ var _ = ginkgo.Describe("Plugin test", func() {
 		var err error
 		var virtualDeployments *appsv1.DeploymentList
 		gomega.Eventually(func() int {
-			virtualDeployments, err = f.VclusterClient.AppsV1().Deployments("default").List(f.Context, metav1.ListOptions{})
+			virtualDeployments, err = f.VClusterClient.AppsV1().Deployments("default").List(f.Context, metav1.ListOptions{})
 			framework.ExpectNoError(err)
 			return len(virtualDeployments.Items)
 		}).
@@ -39,7 +38,7 @@ var _ = ginkgo.Describe("Plugin test", func() {
 		// wait for pod to become ready
 		var podList *corev1.PodList
 		gomega.Eventually(func() bool {
-			podList, err = f.VclusterClient.CoreV1().Pods("default").List(f.Context, metav1.ListOptions{})
+			podList, err = f.VClusterClient.CoreV1().Pods("default").List(f.Context, metav1.ListOptions{})
 			framework.ExpectNoError(err)
 			return len(podList.Items) == 1 && podList.Items[0].Status.Phase == corev1.PodRunning
 		}).
@@ -50,7 +49,7 @@ var _ = ginkgo.Describe("Plugin test", func() {
 		// get pod in host cluster
 		pod := &podList.Items[0]
 		hostPod := &corev1.Pod{}
-		err = f.HostCRClient.Get(f.Context, types.NamespacedName{Name: translate.Default.PhysicalName(pod.Name, pod.Namespace), Namespace: translate.Default.PhysicalNamespace(pod.Namespace)}, hostPod)
+		err = f.HostCRClient.Get(f.Context, translate.Default.HostName(nil, pod.Name, pod.Namespace), hostPod)
 		framework.ExpectNoError(err)
 
 		// check if hook worked
@@ -71,7 +70,7 @@ var _ = ginkgo.Describe("Plugin test", func() {
 
 		// create car in vcluster
 		gomega.Eventually(func() bool {
-			err := f.VclusterCRClient.Create(f.Context, car)
+			err := f.VClusterCRClient.Create(f.Context, car)
 			return err == nil
 		}).
 			WithPolling(pollingInterval).
@@ -80,7 +79,7 @@ var _ = ginkgo.Describe("Plugin test", func() {
 
 		// wait for car to become synced
 		hostCar := &examplev1.Car{}
-		carName := types.NamespacedName{Name: translate.Default.PhysicalName(car.Name, car.Namespace), Namespace: translate.Default.PhysicalNamespace(car.Namespace)}
+		carName := translate.Default.HostName(nil, car.Name, car.Namespace)
 		gomega.Eventually(func() bool {
 			err := f.HostCRClient.Get(f.Context, carName, hostCar)
 			return err == nil
@@ -113,13 +112,13 @@ var _ = ginkgo.Describe("Plugin test", func() {
 		}
 
 		// create service
-		err := f.VclusterCRClient.Create(f.Context, service)
+		err := f.VClusterCRClient.Create(f.Context, service)
 		framework.ExpectNoError(err)
 
 		// wait for service to become synced
 		hostService := &corev1.Service{}
 		gomega.Eventually(func() bool {
-			err := f.HostCRClient.Get(f.Context, types.NamespacedName{Name: translate.Default.PhysicalName(service.Name, service.Namespace), Namespace: f.VclusterNamespace}, hostService)
+			err := f.HostCRClient.Get(f.Context, translate.Default.HostName(nil, service.Name, service.Namespace), hostService)
 			return err == nil
 		}).
 			WithPolling(pollingInterval).
@@ -132,71 +131,10 @@ var _ = ginkgo.Describe("Plugin test", func() {
 		framework.ExpectEqual(hostService.Spec.Ports[1].Port, int32(19000))
 	})
 
-	ginkgo.It("check secret is imported correctly", func() {
-		// create a new secret
-		secret := &corev1.Secret{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      "test123",
-				Namespace: f.VclusterNamespace,
-				Annotations: map[string]string{
-					"vcluster.loft.sh/import": "test/test",
-				},
-			},
-			Data: map[string][]byte{
-				"test": []byte("test"),
-			},
-		}
-
-		// create secret
-		err := f.HostCRClient.Create(f.Context, secret)
-		framework.ExpectNoError(err)
-
-		// wait for secret to become synced
-		vSecret := &corev1.Secret{}
-		gomega.Eventually(func() bool {
-			err := f.VclusterCRClient.Get(f.Context, types.NamespacedName{Name: "test", Namespace: "test"}, vSecret)
-			return err == nil
-		}).
-			WithPolling(pollingInterval).
-			WithTimeout(pollingDurationLong).
-			Should(gomega.BeTrue())
-
-		// check if secret is synced correctly
-		framework.ExpectEqual(len(vSecret.Data), 1)
-		framework.ExpectEqual(vSecret.Data["test"], []byte("test"))
-
-		// change secret
-		secret.Data["test"] = []byte("newtest")
-		err = f.HostCRClient.Update(f.Context, secret)
-		framework.ExpectNoError(err)
-
-		// wait for update
-		gomega.Eventually(func() bool {
-			err := f.VclusterCRClient.Get(f.Context, types.NamespacedName{Name: "test", Namespace: "test"}, vSecret)
-			return err == nil && string(vSecret.Data["test"]) == "newtest"
-		}).
-			WithPolling(pollingInterval).
-			WithTimeout(pollingDurationLong).
-			Should(gomega.BeTrue())
-
-		// delete secret
-		err = f.HostCRClient.Delete(f.Context, secret)
-		framework.ExpectNoError(err)
-
-		// wait for delete within vCluster
-		gomega.Eventually(func() bool {
-			err := f.VclusterCRClient.Get(f.Context, types.NamespacedName{Name: "test", Namespace: "test"}, vSecret)
-			return kerrors.IsNotFound(err)
-		}).
-			WithPolling(pollingInterval).
-			WithTimeout(pollingDurationLong).
-			Should(gomega.BeTrue())
-	})
-
 	ginkgo.It("check the interceptor", func() {
 		// wait for secret to become synced
 		vPod := &corev1.Pod{}
-		err := f.VclusterCRClient.Get(f.Context, types.NamespacedName{Name: "stuff", Namespace: "test"}, vPod)
+		err := f.VClusterCRClient.Get(f.Context, types.NamespacedName{Name: "stuff", Namespace: "test"}, vPod)
 		framework.ExpectNoError(err)
 
 		// check if secret is synced correctly
