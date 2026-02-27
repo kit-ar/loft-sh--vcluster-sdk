@@ -5,7 +5,7 @@ go 1.25
 require (
 	github.com/ghodss/yaml v1.0.0
 	github.com/loft-sh/vcluster v0.30.0
-	github.com/loft-sh/vcluster-sdk v0.6.6-0.20251031120146-544289b7aa30
+	github.com/loft-sh/vcluster-sdk v0.6.6
 	k8s.io/apiextensions-apiserver v0.34.0
 	k8s.io/apimachinery v0.34.0
 	k8s.io/klog/v2 v2.130.1

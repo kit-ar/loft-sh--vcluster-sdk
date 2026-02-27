@@ -1,13 +1,13 @@
 package syncers
 
 import (
-	"context"
 	"fmt"
 	"strings"
 
-	synccontext "github.com/loft-sh/vcluster/pkg/controllers/syncer/context"
-	"github.com/loft-sh/vcluster/pkg/controllers/syncer/translator"
-	synctypes "github.com/loft-sh/vcluster/pkg/types"
+	"github.com/loft-sh/vcluster/pkg/syncer"
+	"github.com/loft-sh/vcluster/pkg/syncer/synccontext"
+	"github.com/loft-sh/vcluster/pkg/syncer/translator"
+	synctypes "github.com/loft-sh/vcluster/pkg/syncer/types"
 	"github.com/loft-sh/vcluster/pkg/util/translate"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
@@ -24,24 +24,33 @@ var (
 	pImportAnnotation   = "vcluster.loft.sh/import"
 )
 
-func NewImportSecrets(ctx *synccontext.RegisterContext) synctypes.Syncer {
-	return &importSecretSyncer{}
+func NewImportSecrets(ctx *synccontext.RegisterContext) synctypes.Base {
+	mapper, err := ctx.Mappings.ByGVK(corev1.SchemeGroupVersion.WithKind("Secret"))
+	if err != nil {
+		klog.FromContext(ctx).Error(err, "unable to get mapping for corev1.Secret")
+		return nil
+	}
+
+	return &importSecretSyncer{
+		GenericTranslator: translator.NewGenericTranslator(ctx, "import-secret", &corev1.Secret{}, mapper),
+	}
 }
 
-type importSecretSyncer struct{}
-
-func (s *importSecretSyncer) Name() string {
-	return "import-secret-syncer"
+type importSecretSyncer struct {
+	synctypes.GenericTranslator
 }
 
-func (s *importSecretSyncer) Resource() client.Object {
-	return &corev1.Secret{}
+func (s *importSecretSyncer) Syncer() synctypes.Sync[client.Object] {
+	return syncer.ToGenericSyncer[*corev1.Secret](s)
 }
 
-var _ synctypes.ToVirtualSyncer = &importSecretSyncer{}
+var _ synctypes.Syncer = &importSecretSyncer{}
 
-func (s *importSecretSyncer) SyncToVirtual(ctx *synccontext.SyncContext, pObj client.Object) (ctrl.Result, error) {
-	pSecret := pObj.(*corev1.Secret)
+func (s *importSecretSyncer) SyncToVirtual(ctx *synccontext.SyncContext, event *synccontext.SyncToVirtualEvent[*corev1.Secret]) (ctrl.Result, error) {
+	pSecret := event.Host
+	if pSecret == nil {
+		return ctrl.Result{}, nil
+	}
 
 	// ignore Secrets synced to the host by the vcluster
 	if pSecret.Labels != nil && pSecret.Labels[translate.MarkerLabel] != "" {
@@ -84,24 +93,30 @@ func (s *importSecretSyncer) SyncToVirtual(ctx *synccontext.SyncContext, pObj cl
 	ctx.Log.Infof("import secret %s/%s into %s/%s", pSecret.GetNamespace(), pSecret.GetName(), vSecret.Namespace, vSecret.Name)
 	err = ctx.VirtualClient.Create(ctx.Context, vSecret)
 	if err != nil {
+		if kerrors.IsAlreadyExists(err) {
+			return ctrl.Result{}, nil
+		}
 		return ctrl.Result{}, fmt.Errorf("failed to import secret %s/%s: %v", pSecret.GetNamespace(), pSecret.GetName(), err)
 	}
 
 	return ctrl.Result{}, err
 }
 
-func (s *importSecretSyncer) Sync(ctx *synccontext.SyncContext, pObj client.Object, vObj client.Object) (ctrl.Result, error) {
-	pSecret := pObj.(*corev1.Secret)
-	vSecret := vObj.(*corev1.Secret)
+func (s *importSecretSyncer) Sync(ctx *synccontext.SyncContext, event *synccontext.SyncEvent[*corev1.Secret]) (ctrl.Result, error) {
+	pSecret := event.Host
+	vSecret := event.Virtual
+	if pSecret == nil || vSecret == nil {
+		return ctrl.Result{}, nil
+	}
 
 	// check if we should delete secret
 	vSecretName := parseFromAnnotation(pSecret.Annotations, pImportAnnotation)
 	if vSecretName.Name == "" {
 		// delete synced secret if the physical secret is not referencing it anymore
-		ctx.Log.Infof("delete virtual secret %s/%s because host secret is no longer pointing to it", vObj.GetNamespace(), vObj.GetName())
-		err := ctx.VirtualClient.Delete(ctx.Context, vObj)
+		ctx.Log.Infof("delete virtual secret %s/%s because host secret is no longer pointing to it", vSecret.GetNamespace(), vSecret.GetName())
+		err := ctx.VirtualClient.Delete(ctx.Context, vSecret)
 		if err != nil {
-			return ctrl.Result{}, fmt.Errorf("failed to delete imported secret %s/%s: %v", vObj.GetNamespace(), vObj.GetName(), err)
+			return ctrl.Result{}, fmt.Errorf("failed to delete imported secret %s/%s: %v", vSecret.GetNamespace(), vSecret.GetName(), err)
 		}
 
 		return ctrl.Result{}, err
@@ -115,16 +130,21 @@ func (s *importSecretSyncer) Sync(ctx *synccontext.SyncContext, pObj client.Obje
 	}
 
 	// update secret
-	ctx.Log.Infof("update imported secret %s/%s", vObj.GetNamespace(), vObj.GetName())
+	ctx.Log.Infof("update imported secret %s/%s", vSecret.GetNamespace(), vSecret.GetName())
 	err := ctx.VirtualClient.Update(ctx.Context, updated)
-	if err == nil {
-		return ctrl.Result{}, fmt.Errorf("failed to update imported secret %s/%s: %v", vObj.GetNamespace(), vObj.GetName(), err)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to update imported secret %s/%s: %v", vSecret.GetNamespace(), vSecret.GetName(), err)
 	}
 
 	return ctrl.Result{}, err
 }
 
-func (s *importSecretSyncer) SyncToHost(ctx *synccontext.SyncContext, vObj client.Object) (ctrl.Result, error) {
+func (s *importSecretSyncer) SyncToHost(ctx *synccontext.SyncContext, event *synccontext.SyncToHostEvent[*corev1.Secret]) (ctrl.Result, error) {
+	vObj := event.Virtual
+	if vObj == nil {
+		return ctrl.Result{}, nil
+	}
+
 	// this is called when the secret in the host gets removed
 	// or if the vObj is an unrelated Secret created in vcluster
 
@@ -143,9 +163,9 @@ func (s *importSecretSyncer) SyncToHost(ctx *synccontext.SyncContext, vObj clien
 }
 
 // IsManaged determines if a physical object is managed by the vcluster
-func (s *importSecretSyncer) IsManaged(ctx context.Context, pObj client.Object) (bool, error) {
+func (s *importSecretSyncer) IsManaged(ctx *synccontext.SyncContext, pObj client.Object) (bool, error) {
 	// check in multi namespace mode
-	if !translate.Default.IsTargetedNamespace(pObj.GetNamespace()) {
+	if !translate.Default.IsTargetedNamespace(ctx, pObj.GetNamespace()) {
 		return false, nil
 	}
 
@@ -153,14 +173,14 @@ func (s *importSecretSyncer) IsManaged(ctx context.Context, pObj client.Object) 
 }
 
 // VirtualToHost translates a virtual name to a physical name
-func (s *importSecretSyncer) VirtualToHost(ctx context.Context, req types.NamespacedName, vObj client.Object) types.NamespacedName {
+func (s *importSecretSyncer) VirtualToHost(ctx *synccontext.SyncContext, req types.NamespacedName, vObj client.Object) types.NamespacedName {
 	if vObj == nil {
 		return types.NamespacedName{}
 	}
 
 	// exclude all objects that are not part of the vCluster namespace
 	name := parseFromAnnotation(vObj.GetAnnotations(), vImportedAnnotation)
-	if !translate.Default.IsTargetedNamespace(name.Namespace) {
+	if !translate.Default.IsTargetedNamespace(ctx, name.Namespace) {
 		return types.NamespacedName{}
 	}
 
@@ -168,7 +188,7 @@ func (s *importSecretSyncer) VirtualToHost(ctx context.Context, req types.Namesp
 }
 
 // HostToVirtual translates a physical name to a virtual name
-func (s *importSecretSyncer) HostToVirtual(ctx context.Context, req types.NamespacedName, pObj client.Object) types.NamespacedName {
+func (s *importSecretSyncer) HostToVirtual(ctx *synccontext.SyncContext, req types.NamespacedName, pObj client.Object) types.NamespacedName {
 	if pObj == nil {
 		return types.NamespacedName{}
 	}
@@ -182,19 +202,25 @@ func (s *importSecretSyncer) translateUpdateUp(pObj, vObj *corev1.Secret) *corev
 	// check annotations
 	expectedAnnotations := getVirtualAnnotations(pObj)
 	if !equality.Semantic.DeepEqual(vObj.GetAnnotations(), expectedAnnotations) {
-		updated = translator.NewIfNil(updated, vObj)
+		if updated == nil {
+			updated = vObj.DeepCopy()
+		}
 		updated.Annotations = expectedAnnotations
 	}
 
 	// check labels
 	if !equality.Semantic.DeepEqual(vObj.GetLabels(), pObj.GetLabels()) {
-		updated = translator.NewIfNil(updated, vObj)
+		if updated == nil {
+			updated = vObj.DeepCopy()
+		}
 		updated.Labels = pObj.GetLabels()
 	}
 
 	// check data
 	if !equality.Semantic.DeepEqual(vObj.Data, pObj.Data) {
-		updated = translator.NewIfNil(updated, vObj)
+		if updated == nil {
+			updated = vObj.DeepCopy()
+		}
 		updated.Data = pObj.Data
 	}
 
